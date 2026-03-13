@@ -1,0 +1,2051 @@
+#!/usr/bin/env python3
+"""
+飞书多维表格 CLI 工具
+
+在用户提供的多维表格内完成完整的数据操作闭环：
+- 数据表管理：在现有 base 内创建/删除表、列出所有表
+- 字段管理：创建、更新、删除字段
+- 记录管理：创建、查询、更新、删除记录（支持分页和筛选）
+- 智能分析：自动识别表结构、字段类型、提供查询建议
+
+不涉及：创建新的多维表格、删除整个多维表格、权限转移
+"""
+
+import argparse
+import csv
+import json
+import os
+import sys
+import threading
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, TypeVar, Generic
+
+import requests
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 数据模型
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FieldType(Enum):
+    """字段类型"""
+    TEXT = 1
+    NUMBER = 2
+    SINGLE_SELECT = 3
+    MULTI_SELECT = 4
+    DATE = 5
+    CHECKBOX = 6
+    USER = 11
+    PHONE = 13
+    EMAIL = 14
+    URL = 15
+    ATTACHMENT = 17
+    LINK = 23
+    DUPLEX_LINK = 21
+    LOCATION = 22
+    PROGRESS = 24
+    RATING = 25
+    CURRENCY = 26
+    PERCENT = 27
+    FORMULA = 20
+
+
+class UIType(Enum):
+    """UI 类型"""
+    TEXT = "Text"
+    NUMBER = "Number"
+    SINGLE_SELECT = "SingleSelect"
+    MULTI_SELECT = "MultiSelect"
+    DATE = "Date"
+    CHECKBOX = "Checkbox"
+    USER = "User"
+    URL = "Url"
+    PHONE = "Phone"
+    EMAIL = "Email"
+    ATTACHMENT = "Attachment"
+    GROUP_CHAT = "GroupChat"
+    LINK = "Link"
+    DUPLEX_LINK = "DuplexLink"
+    LOCATION = "Location"
+    PROGRESS = "Progress"
+    RATING = "Rating"
+    CURRENCY = "Currency"
+    PERCENT = "Percent"
+    FORMULA = "Formula"
+
+
+class Operator(Enum):
+    """筛选操作符"""
+    EQUALS = "is"
+    IS_NOT = "isNot"
+    CONTAINS = "contains"
+    DOES_NOT_CONTAIN = "doesNotContain"
+    IS_EMPTY = "isEmpty"
+    IS_NOT_EMPTY = "isNotEmpty"
+    GREATER_THAN = "isGreater"
+    GREATER_EQUAL = "isGreaterEqual"
+    LESS_THAN = "isLess"
+    LESS_EQUAL = "isLessEqual"
+
+
+@dataclass
+class Field:
+    """字段"""
+    field_id: str
+    field_name: str
+    type: FieldType
+    ui_type: UIType
+    property: Dict = field(default_factory=dict)
+    is_primary: bool = False
+
+
+@dataclass
+class Record:
+    """记录"""
+    record_id: str
+    fields: Dict[str, Any]
+    created_time: Optional[datetime] = None
+    updated_time: Optional[datetime] = None
+
+
+@dataclass
+class Table:
+    """数据表"""
+    table_id: str
+    table_name: str
+    is_blocked: bool = False
+
+
+@dataclass
+class App:
+    """多维表格应用"""
+    app_token: str
+    name: str
+    is_shared: bool = False
+
+
+@dataclass
+class BitableRef:
+    """Bitable 引用"""
+    app_token: str
+    table_id: Optional[str] = None
+    view_id: Optional[str] = None
+
+
+@dataclass
+class FilterCondition:
+    """筛选条件"""
+    field_name: str
+    operator: Operator
+    value: Any = None
+
+    def to_dict(self) -> Dict:
+        result = {
+            "field_name": self.field_name,
+            "operator": self.operator.value,
+        }
+        if self.value is not None:
+            # 飞书 API 要求 value 必须是数组格式
+            if isinstance(self.value, list):
+                result["value"] = self.value
+            else:
+                result["value"] = [str(self.value)]
+        return result
+
+
+@dataclass
+class Filter:
+    """筛选器"""
+    conjunction: str = "and"
+    conditions: List[FilterCondition] = field(default_factory=list)
+    children: List["Filter"] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        result = {"conjunction": self.conjunction}
+        if self.conditions:
+            result["conditions"] = [c.to_dict() for c in self.conditions]
+        if self.children:
+            result["children"] = [c.to_dict() for c in self.children]
+        return result
+
+    @classmethod
+    def and_(cls, *conditions: FilterCondition) -> "Filter":
+        return Filter(conjunction="and", conditions=list(conditions))
+
+    @classmethod
+    def or_(cls, *conditions: FilterCondition) -> "Filter":
+        return Filter(conjunction="or", conditions=list(conditions))
+
+
+@dataclass
+class Sort:
+    """排序"""
+    field_name: str
+    desc: bool = False
+
+    def to_dict(self) -> Dict:
+        return {"field_name": self.field_name, "desc": self.desc}
+
+
+T = TypeVar("T")
+
+
+@dataclass
+class PaginatedResult(Generic[T]):
+    """分页结果"""
+    items: List[T]
+    total: int
+    has_more: bool
+    page_token: Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 异常定义
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BitableError(Exception):
+    """基础异常"""
+    def __init__(self, message: str, code: Optional[int] = None, log_id: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
+        self.log_id = log_id
+
+
+class AuthenticationError(BitableError):
+    """认证错误"""
+    pass
+
+
+class TokenExpiredError(AuthenticationError):
+    """Token 过期"""
+    pass
+
+
+class PermissionDeniedError(BitableError):
+    """权限不足"""
+    pass
+
+
+class RateLimitError(BitableError):
+    """限流错误"""
+    def __init__(self, message: str, retry_after: int = 60, **kwargs):
+        super().__init__(message, **kwargs)
+        self.retry_after = retry_after
+
+
+class ResourceNotFoundError(BitableError):
+    """资源不存在"""
+    pass
+
+
+class AppNotFoundError(ResourceNotFoundError):
+    """多维表格不存在"""
+    pass
+
+
+class TableNotFoundError(ResourceNotFoundError):
+    """数据表不存在"""
+    pass
+
+
+class RecordNotFoundError(ResourceNotFoundError):
+    """记录不存在"""
+    pass
+
+
+class FieldNotFoundError(ResourceNotFoundError):
+    """字段不存在"""
+    pass
+
+
+class ValidationError(BitableError):
+    """参数校验错误"""
+    pass
+
+
+class ConflictError(BitableError):
+    """并发冲突"""
+    pass
+
+
+class ServerError(BitableError):
+    """服务端错误"""
+    pass
+
+
+def raise_for_error(response_data: Dict, log_id: Optional[str] = None):
+    """根据响应数据抛出对应异常"""
+    code = response_data.get("code", 0)
+    msg = response_data.get("msg", "Unknown error")
+
+    if code == 0:
+        return
+
+    error_map = {
+        99991663: (TokenExpiredError, "tenant access token 过期"),
+        99991664: (AuthenticationError, "tenant access token 无效"),
+        99991661: (AuthenticationError, "app access token 无效"),
+        99991662: (AuthenticationError, "app access token 过期"),
+        99991671: (PermissionDeniedError, "没有权限访问此资源"),
+        99991401: (RateLimitError, "请求过于频繁"),
+        99994001: (ResourceNotFoundError, "资源不存在"),
+        1254044: (AppNotFoundError, "多维表格不存在"),
+        1254002: (TableNotFoundError, "数据表不存在"),
+        1254602: (RecordNotFoundError, "记录不存在"),
+        1254604: (FieldNotFoundError, "字段不存在"),
+        2001254291: (ConflictError, "写操作冲突，请稍后重试"),
+    }
+
+    exc_class, default_msg = error_map.get(code, (BitableError, msg))
+
+    if exc_class == RateLimitError:
+        raise exc_class(msg, retry_after=60, code=code, log_id=log_id)
+    raise exc_class(msg, code=code, log_id=log_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Wiki Token 解析器
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class WikiResolver:
+    """Wiki Token 解析器"""
+
+    def __init__(self, client: "BitableClient"):
+        self.client = client
+
+    def resolve(self, wiki_token: str) -> str:
+        """将 Wiki Token 转换为 Bitable Token"""
+        # 使用 wiki/v2/spaces/get_node 端点
+        url = f"{self.client.base_url}/wiki/v2/spaces/get_node"
+        params = {"token": wiki_token}
+
+        try:
+            response = self.client._request("GET", url, params=params)
+            data = response.get("data", {})
+            node = data.get("node", {})
+
+            obj_type = node.get("obj_type", "")
+            if obj_type != "bitable":
+                raise ValueError(f"Wiki 节点类型不是多维表格，而是: {obj_type}")
+
+            return node.get("obj_token")
+        except Exception as e:
+            # 如果 wiki API 失败，尝试直接使用 wiki_token 作为 app_token
+            # 某些旧版 wiki 链接可能直接包含 bitable token
+            raise BitableError(f"无法解析 Wiki 链接: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 客户端
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BitableClient:
+    """飞书多维表格客户端"""
+
+    BASE_URL = "https://open.larkoffice.com/open-apis"
+
+    def __init__(self, app_id: Optional[str] = None, app_secret: Optional[str] = None):
+        self.app_id = app_id or os.environ.get("FEISHU_APP_ID")
+        self.app_secret = app_secret or os.environ.get("FEISHU_APP_SECRET")
+
+        if not self.app_id or not self.app_secret:
+            raise ValueError("必须提供 app_id 和 app_secret，或设置环境变量 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
+
+        self.base_url = self.BASE_URL
+        self._token: Optional[str] = None
+        self._token_expires_at: float = 0
+        self._token_lock = threading.Lock()
+
+        # 初始化子模块
+        self.apps = AppOperations(self)
+        self.tables = TableOperations(self)
+        self.fields = FieldOperations(self)
+        self.records = RecordOperations(self)
+        self.wiki = WikiResolver(self)
+
+    def _get_tenant_access_token(self) -> str:
+        """获取 tenant access token"""
+        url = f"{self.base_url}/auth/v3/tenant_access_token/internal"
+        payload = {"app_id": self.app_id, "app_secret": self.app_secret}
+
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        raise_for_error(data, response.headers.get("X-Log-Id"))
+
+        return data["tenant_access_token"], data.get("expire", 7200)
+
+    def _ensure_token(self):
+        """确保 token 有效"""
+        with self._token_lock:
+            now = time.time()
+            if self._token is None or now >= self._token_expires_at - 300:
+                token, expires_in = self._get_tenant_access_token()
+                self._token = token
+                self._token_expires_at = now + expires_in
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        params: Optional[Dict] = None,
+        json_data: Optional[Dict] = None,
+        retry_count: int = 3,
+    ) -> Dict:
+        """发送 HTTP 请求"""
+        self._ensure_token()
+
+        headers = {"Authorization": f"Bearer {self._token}"}
+
+        for attempt in range(retry_count):
+            try:
+                response = requests.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=json_data,
+                    timeout=60,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                log_id = response.headers.get("X-Log-Id")
+                raise_for_error(data, log_id)
+
+                return data
+
+            except (RateLimitError, ConflictError) as e:
+                if attempt < retry_count - 1:
+                    wait_time = min(2 ** attempt, 30)
+                    time.sleep(wait_time)
+                    continue
+                raise
+            except TokenExpiredError:
+                self._token = None
+                self._ensure_token()
+                headers["Authorization"] = f"Bearer {self._token}"
+                continue
+
+        raise ServerError(f"请求失败，已重试 {retry_count} 次")
+
+    def resolve_url(self, url: str) -> BitableRef:
+        """解析 URL"""
+        import re
+        
+        # 检查是否为 Wiki URL
+        if "/wiki/" in url:
+            match = re.search(r'/wiki/([a-zA-Z0-9]+)', url)
+            if match:
+                wiki_token = match.group(1)
+                app_token = self.wiki.resolve(wiki_token)
+
+                table_match = re.search(r'[?&]table=([a-zA-Z0-9]+)', url)
+                view_match = re.search(r'[?&]view=([a-zA-Z0-9]+)', url)
+
+                return BitableRef(
+                    app_token=app_token,
+                    table_id=table_match.group(1) if table_match else None,
+                    view_id=view_match.group(1) if view_match else None,
+                )
+
+        # 解析普通 base URL
+        match = re.search(r'/base/([a-zA-Z0-9]+)', url)
+        if match:
+            app_token = match.group(1)
+            table_match = re.search(r'[?&]table=([a-zA-Z0-9]+)', url)
+            view_match = re.search(r'[?&]view=([a-zA-Z0-9]+)', url)
+
+            return BitableRef(
+                app_token=app_token,
+                table_id=table_match.group(1) if table_match else None,
+                view_id=view_match.group(1) if view_match else None,
+            )
+
+        raise ValueError(f"无法解析 URL: {url}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 操作类
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AppOperations:
+    """库维度操作"""
+
+    def __init__(self, client: BitableClient):
+        self.client = client
+
+    def create(self, name: str, folder_token: Optional[str] = None) -> App:
+        """创建多维表格"""
+        url = f"{self.client.base_url}/bitable/v1/apps"
+        payload = {"name": name}
+        if folder_token:
+            payload["folder_token"] = folder_token
+
+        response = self.client._request("POST", url, json_data=payload)
+        data = response.get("data", {})
+        return App(
+            app_token=data.get("app_token", ""),
+            name=name,
+        )
+
+    def get_metadata(self, app_token: str) -> App:
+        """获取多维表格元数据"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}"
+        response = self.client._request("GET", url)
+        data = response.get("data", {})
+        app = data.get("app", {})
+        return App(
+            app_token=app_token,
+            name=app.get("name", ""),
+            is_shared=app.get("is_shared", False),
+        )
+
+    def list_tables(self, app_token: str) -> List[Table]:
+        """列出所有数据表"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables"
+        tables = []
+        page_token = None
+
+        while True:
+            params = {"page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
+
+            response = self.client._request("GET", url, params=params)
+            data = response.get("data", {})
+
+            for item in data.get("items", []):
+                tables.append(Table(
+                    table_id=item.get("table_id", ""),
+                    table_name=item.get("name", ""),
+                    is_blocked=item.get("is_blocked", False),
+                ))
+
+            if not data.get("has_more", False):
+                break
+            page_token = data.get("page_token")
+
+        return tables
+
+
+class TableOperations:
+    """表维度操作"""
+
+    def __init__(self, client: BitableClient):
+        self.client = client
+
+    def create(self, app_token: str, table_name: str, fields: Optional[List[Field]] = None, description: Optional[str] = None) -> Table:
+        """创建数据表"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables"
+        payload = {"table": {"name": table_name}}
+        if description:
+            payload["table"]["description"] = description
+        if fields:
+            payload["table"]["fields"] = [
+                {
+                    "field_name": f.field_name,
+                    "type": f.type.value,
+                    "ui_type": f.ui_type.value,
+                    "property": f.property,
+                }
+                for f in fields
+            ]
+
+        response = self.client._request("POST", url, json_data=payload)
+        data = response.get("data", {})
+        return Table(
+            table_id=data.get("table_id", ""),
+            table_name=table_name,
+        )
+
+    def update(self, app_token: str, table_id: str, table_name: str, description: Optional[str] = None) -> Table:
+        """更新数据表"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}"
+        payload = {"name": table_name}
+        if description:
+            payload["description"] = description
+
+        self.client._request("PUT", url, json_data=payload)
+        return Table(table_id=table_id, table_name=table_name)
+
+    def delete(self, app_token: str, table_id: str) -> None:
+        """删除数据表"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}"
+        self.client._request("DELETE", url)
+
+
+class FieldOperations:
+    """字段维度操作"""
+
+    def __init__(self, client: BitableClient):
+        self.client = client
+
+    def list(self, app_token: str, table_id: str, view_id: Optional[str] = None) -> List[Field]:
+        """列出所有字段"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
+        fields = []
+        page_token = None
+
+        while True:
+            params = {"page_size": 100}
+            if view_id:
+                params["view_id"] = view_id
+            if page_token:
+                params["page_token"] = page_token
+
+            response = self.client._request("GET", url, params=params)
+            data = response.get("data", {})
+
+            for item in data.get("items", []):
+                fields.append(self._parse_field(item))
+
+            if not data.get("has_more", False):
+                break
+            page_token = data.get("page_token")
+
+        return fields
+
+    def get_schema(self, app_token: str, table_id: str) -> List[Field]:
+        """获取表 Schema（包含主字段）"""
+        return self.list(app_token, table_id)
+
+    def create(self, app_token: str, table_id: str, field_name: str, field_type: FieldType, ui_type: UIType, property: Optional[Dict] = None) -> Field:
+        """创建字段"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
+        payload = {
+            "field_name": field_name,
+            "type": field_type.value,
+            "ui_type": ui_type.value,
+        }
+        if property:
+            payload["property"] = property
+
+        response = self.client._request("POST", url, json_data=payload)
+        data = response.get("data", {})
+        return self._parse_field(data)
+
+    def update(self, app_token: str, table_id: str, field_id: str, field_name: str, property: Optional[Dict] = None) -> Field:
+        """更新字段"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/fields/{field_id}"
+        payload = {"field_name": field_name}
+        if property:
+            payload["property"] = property
+
+        response = self.client._request("PUT", url, json_data=payload)
+        data = response.get("data", {})
+        return self._parse_field(data)
+
+    def delete(self, app_token: str, table_id: str, field_id: str) -> None:
+        """删除字段"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/fields/{field_id}"
+        self.client._request("DELETE", url)
+
+    def _parse_field(self, data: Dict) -> Field:
+        """解析字段数据"""
+        # 处理未知的 FieldType，使用 TEXT 作为默认值
+        type_value = data.get("type", 1)
+        try:
+            field_type = FieldType(type_value)
+        except ValueError:
+            field_type = FieldType.TEXT
+        
+        # 处理未知的 UIType，使用 TEXT 作为默认值
+        ui_type_value = data.get("ui_type", "Text")
+        try:
+            ui_type = UIType(ui_type_value)
+        except ValueError:
+            ui_type = UIType.TEXT
+        
+        return Field(
+            field_id=data.get("field_id", ""),
+            field_name=data.get("field_name", ""),
+            type=field_type,
+            ui_type=ui_type,
+            property=data.get("property", {}),
+            is_primary=data.get("is_primary", False),
+        )
+
+
+class RecordOperations:
+    """记录维度操作"""
+
+    def __init__(self, client: BitableClient):
+        self.client = client
+        self._write_locks: Dict[str, threading.Lock] = {}
+        self._locks_lock = threading.Lock()
+
+    def _get_write_lock(self, table_id: str) -> threading.Lock:
+        """获取表的写锁"""
+        with self._locks_lock:
+            if table_id not in self._write_locks:
+                self._write_locks[table_id] = threading.Lock()
+            return self._write_locks[table_id]
+
+    def create(self, app_token: str, table_id: str, fields: Dict[str, Any]) -> Record:
+        """创建记录"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records"
+        payload = {"fields": fields}
+
+        with self._get_write_lock(table_id):
+            response = self.client._request("POST", url, json_data=payload)
+        
+        data = response.get("data", {})
+        return self._parse_record(data)
+
+    def batch_create(self, app_token: str, table_id: str, records: List[Dict[str, Any]]) -> List[Record]:
+        """批量创建记录"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create"
+        
+        results = []
+        # 每批最多 500 条
+        for i in range(0, len(records), 500):
+            batch = records[i:i+500]
+            payload = {"records": [{"fields": r} for r in batch]}
+            
+            with self._get_write_lock(table_id):
+                response = self.client._request("POST", url, json_data=payload)
+            
+            data = response.get("data", {})
+            for item in data.get("records", []):
+                results.append(self._parse_record(item))
+        
+        return results
+
+    def get(self, app_token: str, table_id: str, record_id: str) -> Record:
+        """获取单条记录"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}"
+        response = self.client._request("GET", url)
+        data = response.get("data", {})
+        return self._parse_record(data)
+
+    def update(self, app_token: str, table_id: str, record_id: str, fields: Dict[str, Any]) -> Record:
+        """更新记录"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}"
+        payload = {"fields": fields}
+
+        with self._get_write_lock(table_id):
+            response = self.client._request("PUT", url, json_data=payload)
+        
+        data = response.get("data", {})
+        return self._parse_record(data)
+
+    def batch_update(self, app_token: str, table_id: str, records: List[Dict[str, Any]]) -> List[Record]:
+        """批量更新记录"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update"
+        
+        results = []
+        for i in range(0, len(records), 500):
+            batch = records[i:i+500]
+            payload = {"records": batch}
+            
+            with self._get_write_lock(table_id):
+                response = self.client._request("POST", url, json_data=payload)
+            
+            data = response.get("data", {})
+            for item in data.get("records", []):
+                results.append(self._parse_record(item))
+        
+        return results
+
+    def delete(self, app_token: str, table_id: str, record_id: str) -> None:
+        """删除记录"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}"
+        
+        with self._get_write_lock(table_id):
+            self.client._request("DELETE", url)
+
+    def batch_delete(self, app_token: str, table_id: str, record_ids: List[str]) -> None:
+        """批量删除记录"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete"
+        
+        for i in range(0, len(record_ids), 500):
+            batch = record_ids[i:i+500]
+            payload = {"records": batch}
+            
+            with self._get_write_lock(table_id):
+                self.client._request("POST", url, json_data=payload)
+
+    def search(
+        self,
+        app_token: str,
+        table_id: str,
+        filter: Optional[Filter] = None,
+        sort: Optional[List[Sort]] = None,
+        field_names: Optional[List[str]] = None,
+        page_size: int = 500,
+        page_token: Optional[str] = None,
+    ) -> PaginatedResult[Record]:
+        """查询记录"""
+        url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records/search"
+        payload: Dict[str, Any] = {"page_size": min(page_size, 500)}
+        params: Dict[str, str] = {}
+
+        if filter:
+            payload["filter"] = filter.to_dict()
+        if sort:
+            payload["sort"] = [s.to_dict() for s in sort]
+        if field_names:
+            payload["field_names"] = field_names
+
+        # page_token 作为查询参数传递
+        if page_token:
+            params["page_token"] = page_token
+
+        response = self.client._request("POST", url, params=params if params else None, json_data=payload)
+        data = response.get("data", {})
+
+        items = []
+        for item in data.get("items", []):
+            items.append(self._parse_record(item))
+
+        return PaginatedResult(
+            items=items,
+            total=data.get("total", 0),
+            has_more=data.get("has_more", False),
+            page_token=data.get("page_token"),
+        )
+
+    def iter_all(
+        self,
+        app_token: str,
+        table_id: str,
+        filter: Optional[Filter] = None,
+        sort: Optional[List[Sort]] = None,
+        page_size: int = 500,
+        auto_optimize: bool = True,
+    ) -> Iterator[Record]:
+        """迭代所有记录（自动分页，支持动态优化）
+        
+        Args:
+            auto_optimize: 是否启用自动分页优化。大数据量时会动态调整 page_size
+        """
+        page_token = None
+        current_page_size = page_size
+        total_fetched = 0
+        
+        # 自适应分页策略
+        adaptive_strategy = {
+            "initial": min(page_size, 500),
+            "large_table_threshold": 10000,  # 大表阈值
+            "small_page": 100,  # 小分页（用于大表或筛选条件）
+            "normal_page": 500,  # 正常分页
+        }
+        
+        if auto_optimize:
+            current_page_size = adaptive_strategy["initial"]
+
+        while True:
+            result = self.search(
+                app_token=app_token,
+                table_id=table_id,
+                filter=filter,
+                sort=sort,
+                page_size=current_page_size,
+                page_token=page_token,
+            )
+
+            for record in result.items:
+                yield record
+            
+            total_fetched += len(result.items)
+
+            if not result.has_more:
+                break
+            
+            page_token = result.page_token
+            
+            # 自动优化：根据返回数据量调整 page_size
+            if auto_optimize:
+                # 如果返回记录数接近上限，说明数据量大，保持或增加 page_size
+                if len(result.items) >= current_page_size * 0.9:
+                    # 数据充足，可以使用最大分页
+                    current_page_size = adaptive_strategy["normal_page"]
+                # 如果返回记录数很少，可能是筛选条件导致，减小 page_size 避免空跑
+                elif len(result.items) < current_page_size * 0.1:
+                    current_page_size = max(adaptive_strategy["small_page"], current_page_size // 2)
+                
+                # 确保不超过 API 限制
+                current_page_size = min(current_page_size, 500)
+
+    def count(self, app_token: str, table_id: str, filter: Optional[Filter] = None) -> int:
+        """统计记录数"""
+        result = self.search(app_token, table_id, filter=filter, page_size=1)
+        return result.total
+
+    def _parse_record(self, data: Dict) -> Record:
+        """解析记录数据"""
+        fields = data.get("fields", {})
+
+        return Record(
+            record_id=data.get("record_id", ""),
+            fields=fields,
+            created_time=self._parse_time(data.get("created_time")),
+            updated_time=self._parse_time(data.get("last_modified_time")),
+        )
+
+    def _parse_time(self, time_str: Optional[str]) -> Optional[datetime]:
+        """解析时间字符串"""
+        if not time_str:
+            return None
+        try:
+            return datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+        except:
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI 主函数
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="飞书多维表格 CLI 工具 - 完整版",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 库的维度（在现有多维表格内操作）
+  bitable list-tables "https://bytedance.larkoffice.com/base/xxx"
+  bitable create-table "https://..." "任务表" --field "名称:text" --field "状态:single_select"
+  bitable delete-table "https://..." --table-id "tblxxx"
+
+  # 字段维度
+  bitable create-field "https://..." "优先级" single_select --options "高,中,低"
+  bitable update-field "https://..." --field-id "fldxxx" --name "新名称"
+  bitable delete-field "https://..." --field-id "fldxxx"
+
+  # 记录维度
+  bitable create-record "https://..." --data '{"名称":"任务1","状态":"进行中"}'
+  bitable update-record "https://..." --record-id "recxxx" --data '{"状态":"已完成"}'
+  bitable delete-record "https://..." --record-id "recxxx"
+  bitable query "https://..." --filter "状态=进行中"
+
+  # 智能分析
+  bitable summary "https://..."
+        """
+    )
+
+    parser.add_argument("--app-id", help="飞书应用 App ID（或设置 FEISHU_APP_ID 环境变量）")
+    parser.add_argument("--app-secret", help="飞书应用 App Secret（或设置 FEISHU_APP_SECRET 环境变量）")
+
+    subparsers = parser.add_subparsers(dest="command", help="可用命令")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 库的维度（在现有多维表格内操作）
+    # ═════════════════════════════════════════════════════════════════════════
+
+    # list-tables 命令
+    list_tables_parser = subparsers.add_parser("list-tables", help="列出所有数据表")
+    list_tables_parser.add_argument("url", help="多维表格 URL")
+
+    # create-table 命令
+    create_table_parser = subparsers.add_parser("create-table", help="创建数据表")
+    create_table_parser.add_argument("url", help="多维表格 URL")
+    create_table_parser.add_argument("name", help="表名称")
+    create_table_parser.add_argument("--field", action="append", help="初始字段，格式：字段名:类型")
+    create_table_parser.add_argument("--description", help="表描述")
+
+    # update-table 命令
+    update_table_parser = subparsers.add_parser("update-table", help="更新数据表")
+    update_table_parser.add_argument("url", help="多维表格 URL")
+    update_table_parser.add_argument("--table-id", required=True, help="表 ID")
+    update_table_parser.add_argument("--name", required=True, help="新表名")
+
+    # delete-table 命令
+    delete_table_parser = subparsers.add_parser("delete-table", help="删除数据表")
+    delete_table_parser.add_argument("url", help="多维表格 URL")
+    delete_table_parser.add_argument("--table-id", required=True, help="表 ID")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 字段维度
+    # ═════════════════════════════════════════════════════════════════════════
+    
+    # create-field 命令
+    create_field_parser = subparsers.add_parser("create-field", help="创建字段")
+    create_field_parser.add_argument("url", help="多维表格 URL")
+    create_field_parser.add_argument("name", help="字段名称")
+    create_field_parser.add_argument("type", choices=["text", "number", "single_select", "multi_select", "date", "checkbox"], help="字段类型")
+    create_field_parser.add_argument("--options", help="选项（单选/多选），逗号分隔")
+    create_field_parser.add_argument("--formatter", help="数字格式（如 0.00）")
+
+    # update-field 命令
+    update_field_parser = subparsers.add_parser("update-field", help="更新字段")
+    update_field_parser.add_argument("url", help="多维表格 URL")
+    update_field_parser.add_argument("--field-id", required=True, help="字段 ID")
+    update_field_parser.add_argument("--name", help="新字段名")
+
+    # delete-field 命令
+    delete_field_parser = subparsers.add_parser("delete-field", help="删除字段")
+    delete_field_parser.add_argument("url", help="多维表格 URL")
+    delete_field_parser.add_argument("--field-id", required=True, help="字段 ID")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 记录维度
+    # ═════════════════════════════════════════════════════════════════════════
+    
+    # create-record 命令
+    create_record_parser = subparsers.add_parser("create-record", help="创建记录")
+    create_record_parser.add_argument("url", help="多维表格 URL")
+    create_record_parser.add_argument("--data", required=True, help="记录数据，JSON 格式")
+
+    # batch-create 命令
+    batch_create_parser = subparsers.add_parser("batch-create", help="批量创建记录")
+    batch_create_parser.add_argument("url", help="多维表格 URL")
+    batch_create_parser.add_argument("--file", required=True, help="JSON 文件路径，每行一个记录")
+
+    # get-record 命令
+    get_record_parser = subparsers.add_parser("get-record", help="获取单条记录")
+    get_record_parser.add_argument("url", help="多维表格 URL")
+    get_record_parser.add_argument("--record-id", required=True, help="记录 ID")
+
+    # update-record 命令
+    update_record_parser = subparsers.add_parser("update-record", help="更新记录")
+    update_record_parser.add_argument("url", help="多维表格 URL")
+    update_record_parser.add_argument("--record-id", required=True, help="记录 ID")
+    update_record_parser.add_argument("--data", required=True, help="记录数据，JSON 格式")
+
+    # delete-record 命令
+    delete_record_parser = subparsers.add_parser("delete-record", help="删除记录")
+    delete_record_parser.add_argument("url", help="多维表格 URL")
+    delete_record_parser.add_argument("--record-id", required=True, help="记录 ID")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 查询和分析
+    # ═════════════════════════════════════════════════════════════════════════
+    
+    # query 命令
+    query_parser = subparsers.add_parser("query", help="查询记录")
+    query_parser.add_argument("url", help="多维表格 URL")
+    query_parser.add_argument("--filter", "-f", action="append", help="筛选条件，格式：字段名=值 或 字段名:值")
+    query_parser.add_argument("--field", action="append", help="只返回指定字段")
+    query_parser.add_argument("--limit", "-l", type=int, help="最多返回多少条")
+    query_parser.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    # count 命令
+    count_parser = subparsers.add_parser("count", help="统计记录数")
+    count_parser.add_argument("url", help="多维表格 URL")
+    count_parser.add_argument("--filter", "-f", action="append", help="筛选条件")
+
+    # smart-query 命令（自然语言查询）
+    smart_query_parser = subparsers.add_parser("smart-query", help="自然语言智能查询")
+    smart_query_parser.add_argument("url", help="多维表格 URL")
+    smart_query_parser.add_argument("query", help="自然语言查询，如：查找张三关于 openclaw 的讨论")
+    smart_query_parser.add_argument("--limit", "-l", type=int, default=20, help="最多返回多少条")
+    smart_query_parser.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    # health-check 命令（前置健康检查）
+    health_parser = subparsers.add_parser("health-check", help="检查多维表格访问权限和连接状态")
+    health_parser.add_argument("url", nargs="?", help="多维表格 URL（可选，不提供则只检查认证）")
+    health_parser.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    # analyze 命令（增强版智能分析）
+    analyze_parser = subparsers.add_parser("analyze", help="深度分析多维表格结构和数据")
+    analyze_parser.add_argument("url", help="多维表格 URL")
+    analyze_parser.add_argument("--json", action="store_true", help="输出 JSON 格式")
+    analyze_parser.add_argument("--sample-size", type=int, default=100, help="采样分析的记录数（默认100）")
+
+    # summary 命令（保留为 analyze 的别名）
+    summary_parser = subparsers.add_parser("summary", help="智能分析多维表格（analyze 的别名）")
+    summary_parser.add_argument("url", help="多维表格 URL")
+    summary_parser.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    # export 命令
+    export_parser = subparsers.add_parser("export", help="导出记录")
+    export_parser.add_argument("url", help="多维表格 URL")
+    export_parser.add_argument("output", help="输出文件路径")
+    export_parser.add_argument("--format", choices=["json", "csv"], default="json", help="输出格式")
+    export_parser.add_argument("--filter", "-f", action="append", help="筛选条件")
+
+    args = parser.parse_args()
+
+    # 设置环境变量
+    if args.app_id:
+        os.environ["FEISHU_APP_ID"] = args.app_id
+    if args.app_secret:
+        os.environ["FEISHU_APP_SECRET"] = args.app_secret
+
+    if not args.command:
+        parser.print_help()
+        return
+
+    try:
+        client = BitableClient()
+        handle_command(client, args)
+    except Exception as e:
+        print(f"错误: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def handle_command(client: BitableClient, args):
+    """处理命令"""
+    command = args.command
+
+    # 库的维度（在现有多维表格内操作）
+    if command == "list-tables":
+        ref = client.resolve_url(args.url)
+        tables = client.apps.list_tables(ref.app_token)
+        print(f"\n数据表列表 ({len(tables)}个):")
+        for t in tables:
+            print(f"  • {t.table_name} (ID: {t.table_id})")
+
+    elif command == "create-table":
+        ref = client.resolve_url(args.url)
+        fields = []
+        if args.field:
+            for f in args.field:
+                name, type_str = f.split(":", 1)
+                field_type, ui_type = _parse_field_type(type_str)
+                fields.append(Field(field_id="", field_name=name, type=field_type, ui_type=ui_type))
+        
+        table = client.tables.create(ref.app_token, args.name, fields, args.description)
+        print(f"创建成功: {table.table_name}")
+        print(f"Table ID: {table.table_id}")
+
+    elif command == "update-table":
+        ref = client.resolve_url(args.url)
+        client.tables.update(ref.app_token, args.table_id, args.name)
+        print("更新成功")
+
+    elif command == "delete-table":
+        ref = client.resolve_url(args.url)
+        client.tables.delete(ref.app_token, args.table_id)
+        print("删除成功")
+
+    # 字段维度
+    elif command == "create-field":
+        ref = client.resolve_url(args.url)
+        field_type, ui_type = _parse_field_type(args.type)
+        
+        property = {}
+        if args.type in ["single_select", "multi_select"] and args.options:
+            options = [{"name": o.strip()} for o in args.options.split(",")]
+            property = {"options": options}
+        if args.type == "number" and args.formatter:
+            property = {"formatter": args.formatter}
+        
+        field = client.fields.create(ref.app_token, ref.table_id, args.name, field_type, ui_type, property)
+        print(f"创建成功: {field.field_name}")
+        print(f"Field ID: {field.field_id}")
+
+    elif command == "update-field":
+        ref = client.resolve_url(args.url)
+        client.fields.update(ref.app_token, ref.table_id, args.field_id, args.name)
+        print("更新成功")
+
+    elif command == "delete-field":
+        ref = client.resolve_url(args.url)
+        client.fields.delete(ref.app_token, ref.table_id, args.field_id)
+        print("删除成功")
+
+    # 记录维度
+    elif command == "create-record":
+        ref = client.resolve_url(args.url)
+        data = json.loads(args.data)
+        record = client.records.create(ref.app_token, ref.table_id, data)
+        print(f"创建成功: {record.record_id}")
+
+    elif command == "batch-create":
+        ref = client.resolve_url(args.url)
+        with open(args.file, "r", encoding="utf-8") as f:
+            records = [json.loads(line) for line in f if line.strip()]
+        results = client.records.batch_create(ref.app_token, ref.table_id, records)
+        print(f"创建成功: {len(results)} 条记录")
+
+    elif command == "get-record":
+        ref = client.resolve_url(args.url)
+        record = client.records.get(ref.app_token, ref.table_id, args.record_id)
+        print(json.dumps({"record_id": record.record_id, "fields": record.fields}, ensure_ascii=False, indent=2))
+
+    elif command == "update-record":
+        ref = client.resolve_url(args.url)
+        data = json.loads(args.data)
+        record = client.records.update(ref.app_token, ref.table_id, args.record_id, data)
+        print(f"更新成功: {record.record_id}")
+
+    elif command == "delete-record":
+        ref = client.resolve_url(args.url)
+        client.records.delete(ref.app_token, ref.table_id, args.record_id)
+        print("删除成功")
+
+    # 查询和分析
+    elif command == "health-check":
+        _handle_health_check(client, args)
+
+    elif command == "query":
+        _handle_query(client, args)
+
+    elif command == "count":
+        ref = client.resolve_url(args.url)
+        filter_obj = _build_filter(args.filter) if args.filter else None
+        count = client.records.count(ref.app_token, ref.table_id, filter=filter_obj)
+        print(count)
+
+    elif command == "smart-query":
+        _handle_smart_query(client, args)
+
+    elif command == "analyze":
+        _handle_analyze(client, args)
+
+    elif command == "summary":
+        # summary 作为 analyze 的别名，使用默认参数
+        args.sample_size = 100
+        _handle_analyze(client, args)
+
+    elif command == "export":
+        _handle_export(client, args)
+
+
+def _parse_field_type(type_str: str) -> tuple:
+    """解析字段类型"""
+    type_map = {
+        "text": (FieldType.TEXT, UIType.TEXT),
+        "number": (FieldType.NUMBER, UIType.NUMBER),
+        "single_select": (FieldType.SINGLE_SELECT, UIType.SINGLE_SELECT),
+        "multi_select": (FieldType.MULTI_SELECT, UIType.MULTI_SELECT),
+        "date": (FieldType.DATE, UIType.DATE),
+        "checkbox": (FieldType.CHECKBOX, UIType.CHECKBOX),
+    }
+    return type_map.get(type_str, (FieldType.TEXT, UIType.TEXT))
+
+
+def _build_filter(filter_args: List[str]) -> Optional[Filter]:
+    """构建筛选条件"""
+    if not filter_args:
+        return None
+    
+    conditions = []
+    for f in filter_args:
+        if "=" in f:
+            field, value = f.split("=", 1)
+            conditions.append(FilterCondition(field, Operator.EQUALS, value))
+        elif ":" in f:
+            field, value = f.split(":", 1)
+            conditions.append(FilterCondition(field, Operator.CONTAINS, value))
+    
+    if conditions:
+        return Filter.and_(*conditions)
+    return None
+
+
+def _handle_health_check(client: BitableClient, args):
+    """健康检查 - Phase 1 专业级增强"""
+    import time
+    start_time = time.time()
+    
+    result = {
+        "timestamp": datetime.now().isoformat(),
+        "checks": {},
+        "overall_status": "unknown",
+        "issues": [],
+        "suggestions": [],
+    }
+    
+    # 1. 认证检查
+    try:
+        auth_start = time.time()
+        # 触发 token 获取
+        client._ensure_token()
+        auth_time = (time.time() - auth_start) * 1000
+        result["checks"]["authentication"] = {
+            "status": "pass",
+            "message": "认证成功",
+            "latency_ms": round(auth_time, 2),
+        }
+    except Exception as e:
+        result["checks"]["authentication"] = {
+            "status": "fail",
+            "message": f"认证失败: {e}",
+        }
+        result["issues"].append("飞书应用凭证无效或未配置")
+        result["suggestions"].append("请检查 FEISHU_APP_ID 和 FEISHU_APP_SECRET 环境变量")
+    
+    # 2. 连接检查（如果提供了 URL）
+    if args.url:
+        try:
+            conn_start = time.time()
+            ref = client.resolve_url(args.url)
+            conn_time = (time.time() - conn_start) * 1000
+            
+            result["checks"]["connection"] = {
+                "status": "pass",
+                "message": "连接成功",
+                "latency_ms": round(conn_time, 2),
+                "app_token": ref.app_token,
+                "table_id": ref.table_id,
+            }
+            
+            # 3. 权限检查
+            try:
+                perm_start = time.time()
+                app = client.apps.get_metadata(ref.app_token)
+                tables = client.apps.list_tables(ref.app_token)
+                perm_time = (time.time() - perm_start) * 1000
+                
+                result["checks"]["permissions"] = {
+                    "status": "pass",
+                    "message": "权限正常",
+                    "latency_ms": round(perm_time, 2),
+                    "app_name": app.name,
+                    "table_count": len(tables),
+                }
+                
+                # 4. 表访问检查（如果指定了表）
+                if ref.table_id:
+                    try:
+                        table_start = time.time()
+                        fields = client.fields.get_schema(ref.app_token, ref.table_id)
+                        record_count = client.records.count(ref.app_token, ref.table_id)
+                        table_time = (time.time() - table_start) * 1000
+                        
+                        result["checks"]["table_access"] = {
+                            "status": "pass",
+                            "message": "表访问正常",
+                            "latency_ms": round(table_time, 2),
+                            "field_count": len(fields),
+                            "record_count": record_count,
+                        }
+                    except Exception as e:
+                        result["checks"]["table_access"] = {
+                            "status": "fail",
+                            "message": f"表访问失败: {e}",
+                        }
+                        result["issues"].append("无法访问指定的数据表")
+                        result["suggestions"].append("请检查 URL 中的 table_id 是否正确")
+                
+            except PermissionDeniedError as e:
+                result["checks"]["permissions"] = {
+                    "status": "fail",
+                    "message": f"权限不足: {e}",
+                }
+                result["issues"].append("应用没有权限访问此多维表格")
+                result["suggestions"].append("请将应用添加为多维表格的协作者")
+            except Exception as e:
+                result["checks"]["permissions"] = {
+                    "status": "fail",
+                    "message": f"权限检查失败: {e}",
+                }
+                
+        except Exception as e:
+            result["checks"]["connection"] = {
+                "status": "fail",
+                "message": f"连接失败: {e}",
+            }
+            result["issues"].append("无法解析或连接到多维表格")
+            result["suggestions"].append("请检查 URL 是否正确")
+    
+    # 计算总体状态
+    check_statuses = [c["status"] for c in result["checks"].values()]
+    if all(s == "pass" for s in check_statuses):
+        result["overall_status"] = "healthy"
+    elif any(s == "fail" for s in check_statuses):
+        result["overall_status"] = "unhealthy"
+    else:
+        result["overall_status"] = "degraded"
+    
+    result["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
+    
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        _print_health_check(result)
+
+
+def _print_health_check(result: Dict):
+    """打印健康检查结果"""
+    status_icons = {
+        "pass": "✓",
+        "fail": "✗",
+        "warning": "⚠",
+    }
+    
+    overall_icons = {
+        "healthy": "✅",
+        "unhealthy": "❌",
+        "degraded": "⚠️",
+    }
+    
+    print(f"\n{'='*70}")
+    print(f"{overall_icons.get(result['overall_status'], '❓')} 健康检查报告")
+    print(f"{'='*70}")
+    
+    print(f"\n【检查项】")
+    for check_name, check_result in result["checks"].items():
+        icon = status_icons.get(check_result["status"], "?")
+        print(f"  {icon} {check_name}: {check_result['message']}")
+        if "latency_ms" in check_result:
+            print(f"      延迟: {check_result['latency_ms']}ms")
+        if "record_count" in check_result:
+            print(f"      记录数: {check_result['record_count']}")
+        if "field_count" in check_result:
+            print(f"      字段数: {check_result['field_count']}")
+    
+    if result["issues"]:
+        print(f"\n【⚠️  发现问题】")
+        for issue in result["issues"]:
+            print(f"  • {issue}")
+    
+    if result["suggestions"]:
+        print(f"\n【💡 建议】")
+        for suggestion in result["suggestions"]:
+            print(f"  • {suggestion}")
+    
+    print(f"\n总体状态: {result['overall_status'].upper()}")
+    print(f"检查耗时: {result['total_time_ms']}ms")
+    print(f"{'='*70}")
+
+
+def _handle_query(client: BitableClient, args):
+    """处理查询命令"""
+    ref = client.resolve_url(args.url)
+    filter_obj = _build_filter(args.filter)
+    
+    records = []
+    count = 0
+    for record in client.records.iter_all(ref.app_token, ref.table_id, filter=filter_obj, page_size=500):
+        if args.field:
+            filtered_fields = {k: v for k, v in record.fields.items() if k in args.field}
+            records.append({"record_id": record.record_id, "fields": filtered_fields})
+        else:
+            records.append({"record_id": record.record_id, "fields": record.fields})
+        
+        count += 1
+        if args.limit and count >= args.limit:
+            break
+    
+    if args.json:
+        print(json.dumps(records, ensure_ascii=False, indent=2))
+    else:
+        print(f"\n共 {len(records)} 条记录:")
+        for i, r in enumerate(records, 1):
+            print(f"\n  记录 {i} (ID: {r['record_id']}):")
+            for k, v in r['fields'].items():
+                v_str = str(v)
+                if len(v_str) > 80:
+                    v_str = v_str[:77] + "..."
+                print(f"    {k}: {v_str}")
+
+
+def _handle_smart_query(client: BitableClient, args):
+    """自然语言智能查询"""
+    import re
+    
+    ref = client.resolve_url(args.url)
+    query_text = args.query
+    
+    # 获取表结构
+    fields = client.fields.get_schema(ref.app_token, ref.table_id)
+    field_names = [f.field_name for f in fields]
+    
+    # 解析自然语言查询
+    parsed = _parse_natural_language(query_text, field_names)
+    
+    # 构建筛选条件
+    filter_conditions = []
+    selected_fields = []
+    
+    for condition in parsed["conditions"]:
+        if condition["type"] == "person":
+            # 人员筛选
+            filter_conditions.append(FilterCondition(condition["field"], Operator.EQUALS, condition["value"]))
+        elif condition["type"] == "content":
+            # 内容模糊搜索
+            filter_conditions.append(FilterCondition(condition["field"], Operator.CONTAINS, condition["value"]))
+        elif condition["type"] == "status":
+            # 状态筛选
+            filter_conditions.append(FilterCondition(condition["field"], Operator.EQUALS, condition["value"]))
+        elif condition["type"] == "date":
+            # 日期筛选（简化处理）
+            filter_conditions.append(FilterCondition(condition["field"], Operator.GREATER_EQUAL, condition["value"]))
+    
+    # 如果没有匹配到条件，使用第一个文本字段进行模糊搜索
+    if not filter_conditions:
+        text_fields = [f for f in fields if f.type == FieldType.TEXT]
+        if text_fields:
+            # 把整个查询作为关键词搜索
+            filter_conditions.append(FilterCondition(text_fields[0].field_name, Operator.CONTAINS, query_text))
+            selected_fields = [text_fields[0].field_name]
+    
+    # 构建筛选器
+    filter_obj = Filter.and_(*filter_conditions) if filter_conditions else None
+    
+    # 智能选择返回字段
+    if not selected_fields:
+        # 优先返回内容字段 + 人员字段 + 日期字段
+        for f in fields:
+            category = _categorize_field_for_smart_query(f)
+            if category in ("content", "person", "date", "title"):
+                selected_fields.append(f.field_name)
+        # 限制字段数量
+        selected_fields = selected_fields[:5]
+    
+    # 执行查询
+    records = []
+    count = 0
+    for record in client.records.iter_all(ref.app_token, ref.table_id, filter=filter_obj, page_size=500):
+        filtered_fields = {k: v for k, v in record.fields.items() if k in selected_fields}
+        records.append({"record_id": record.record_id, "fields": filtered_fields})
+        
+        count += 1
+        if args.limit and count >= args.limit:
+            break
+    
+    # 输出结果
+    if args.json:
+        result = {
+            "original_query": query_text,
+            "parsed_conditions": parsed["conditions"],
+            "applied_filters": [{"field": c.field_name, "operator": c.operator.value, "value": c.value} for c in filter_conditions],
+            "selected_fields": selected_fields,
+            "record_count": len(records),
+            "records": records,
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"\n🔍 自然语言查询: {query_text}")
+        print(f"\n解析结果:")
+        for cond in parsed["conditions"]:
+            print(f"  • {cond['type']}: {cond['field']} = {cond['value']}")
+        if filter_conditions:
+            print(f"\n应用筛选:")
+            for fc in filter_conditions:
+                print(f"  • {fc.field_name} {fc.operator.value} {fc.value}")
+        print(f"\n返回字段: {', '.join(selected_fields)}")
+        print(f"\n共 {len(records)} 条记录:")
+        for i, r in enumerate(records, 1):
+            print(f"\n  记录 {i}:")
+            for k, v in r['fields'].items():
+                v_str = str(v)
+                if len(v_str) > 100:
+                    v_str = v_str[:97] + "..."
+                print(f"    {k}: {v_str}")
+
+
+def _parse_natural_language(query: str, field_names: List[str]) -> Dict:
+    """解析自然语言查询"""
+    conditions = []
+    query_lower = query.lower()
+    
+    # 模式 1: "查找/搜索/获取 ... 关于 ... 的 ..."
+    # 示例: "查找张三关于 openclaw 的讨论"
+    person_pattern = r"(?:查找|搜索|获取|找)\s*(.+?)(?:关于|的|在)"
+    content_pattern = r"关于\s*(.+?)(?:的|讨论|记录|内容)"
+    
+    person_match = re.search(person_pattern, query)
+    content_match = re.search(content_pattern, query)
+    
+    if person_match:
+        person_name = person_match.group(1).strip()
+        # 匹配人员字段
+        person_field = _find_best_field_match(field_names, ["人", "负责人", "发送人", "作者", "owner", "assignee"])
+        if person_field:
+            conditions.append({
+                "type": "person",
+                "field": person_field,
+                "value": person_name,
+            })
+    
+    if content_match:
+        content_keyword = content_match.group(1).strip()
+        # 匹配内容字段
+        content_field = _find_best_field_match(field_names, ["内容", "记录", "描述", "聊天记录", "文档", "content", "message"])
+        if content_field:
+            conditions.append({
+                "type": "content",
+                "field": content_field,
+                "value": content_keyword,
+            })
+    
+    # 模式 2: "状态为 ... 的 ..."
+    # 示例: "状态为进行中的任务"
+    status_pattern = r"(?:状态|进度)\s*(?:为|是|等于)?\s*(.+?)(?:的|$)"
+    status_match = re.search(status_pattern, query)
+    if status_match:
+        status_value = status_match.group(1).strip()
+        status_field = _find_best_field_match(field_names, ["状态", "status", "进度", "stage"])
+        if status_field:
+            conditions.append({
+                "type": "status",
+                "field": status_field,
+                "value": status_value,
+            })
+    
+    # 模式 3: "最近/今天/本周 ..."
+    date_keywords = {
+        "今天": "today",
+        "昨天": "yesterday",
+        "本周": "this_week",
+        "最近": "recent",
+    }
+    for keyword, date_type in date_keywords.items():
+        if keyword in query:
+            date_field = _find_best_field_match(field_names, ["时间", "日期", "time", "date", "created", "updated"])
+            if date_field:
+                conditions.append({
+                    "type": "date",
+                    "field": date_field,
+                    "value": date_type,
+                })
+                break
+    
+    # 模式 4: 如果什么都没匹配到，尝试提取关键词
+    if not conditions:
+        # 提取 2-10 个字符的关键词
+        keywords = re.findall(r'[\u4e00-\u9fa5a-zA-Z0-9]{2,10}', query)
+        if keywords:
+            # 使用最长的作为关键词
+            keyword = max(keywords, key=len)
+            content_field = _find_best_field_match(field_names, ["内容", "记录", "描述", "聊天记录", "文档", "content", "message", "标题", "name"])
+            if content_field:
+                conditions.append({
+                    "type": "content",
+                    "field": content_field,
+                    "value": keyword,
+                })
+    
+    return {"conditions": conditions}
+
+
+def _find_best_field_match(field_names: List[str], keywords: List[str]) -> Optional[str]:
+    """根据关键词找到最佳匹配的字段名"""
+    for keyword in keywords:
+        for field_name in field_names:
+            if keyword.lower() in field_name.lower():
+                return field_name
+    return None
+
+
+def _categorize_field_for_smart_query(field: Field) -> str:
+    """为智能查询分类字段"""
+    name_lower = field.field_name.lower()
+    
+    if field.is_primary:
+        return "title"
+    if field.type == FieldType.TEXT:
+        if any(kw in name_lower for kw in ["内容", "描述", "详情", "content", "正文", "文档", "记录", "聊天记录", "消息"]):
+            return "content"
+        if any(kw in name_lower for kw in ["名", "标题", "title", "subject", "名称"]):
+            return "title"
+    if any(kw in name_lower for kw in ["人", "负责人", "owner", "assignee", "创建人", "更新人", "发送人", "作者"]):
+        return "person"
+    if any(kw in name_lower for kw in ["日期", "时间", "date", "time", "deadline", "created", "updated"]):
+        return "date"
+    if any(kw in name_lower for kw in ["状态", "status", "进度", "stage", "类型", "分类", "category"]):
+        return "status"
+    return "other"
+
+
+def _handle_summary(client: BitableClient, args):
+    """处理智能分析命令"""
+    ref = client.resolve_url(args.url)
+    
+    # 获取基本信息
+    app = client.apps.get_metadata(ref.app_token)
+    tables = client.apps.list_tables(ref.app_token)
+    
+    # 获取当前表信息
+    table = next((t for t in tables if t.table_id == ref.table_id), None)
+    fields = client.fields.get_schema(ref.app_token, ref.table_id)
+    record_count = client.records.count(ref.app_token, ref.table_id)
+    
+    # 获取样本记录
+    samples_result = client.records.search(ref.app_token, ref.table_id, page_size=5)
+    samples = samples_result.items
+    
+    # 智能字段分析
+    field_analysis = _analyze_fields(fields, samples)
+    
+    result = {
+        "bitable": {
+            "name": app.name,
+            "app_token": ref.app_token,
+            "table_count": len(tables),
+            "tables": [{"name": t.table_name, "id": t.table_id} for t in tables],
+        },
+        "current_table": {
+            "name": table.table_name if table else "Unknown",
+            "table_id": ref.table_id,
+            "record_count": record_count,
+            "field_count": len(fields),
+            "fields": [{"name": f.field_name, "type": f.type.name, "is_primary": f.is_primary} for f in fields],
+        },
+        "field_analysis": field_analysis,
+        "sample_records": [{"record_id": r.record_id, "fields": r.fields} for r in samples],
+    }
+    
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        _print_summary(result)
+
+
+def _analyze_fields(fields: List[Field], samples: List[Record]) -> Dict:
+    """智能分析字段"""
+    analysis = {
+        "primary_field": None,
+        "status_fields": [],
+        "category_fields": [],
+        "date_fields": [],
+        "person_fields": [],
+        "content_fields": [],
+        "filterable_fields": [],
+    }
+    
+    for f in fields:
+        if f.is_primary:
+            analysis["primary_field"] = f.field_name
+        
+        name_lower = f.field_name.lower()
+        
+        if any(kw in name_lower for kw in ["状态", "status", "进度", "stage"]):
+            analysis["status_fields"].append(f.field_name)
+            analysis["filterable_fields"].append(f.field_name)
+        elif any(kw in name_lower for kw in ["类型", "分类", "category", "优先级", "priority"]):
+            analysis["category_fields"].append(f.field_name)
+            analysis["filterable_fields"].append(f.field_name)
+        elif any(kw in name_lower for kw in ["日期", "时间", "date", "time"]):
+            analysis["date_fields"].append(f.field_name)
+        elif any(kw in name_lower for kw in ["人", "负责人", "owner", "assignee"]):
+            analysis["person_fields"].append(f.field_name)
+            analysis["filterable_fields"].append(f.field_name)
+        elif f.type == FieldType.TEXT and any(kw in name_lower for kw in ["名", "标题", "描述", "content"]):
+            analysis["content_fields"].append(f.field_name)
+    
+    return analysis
+
+
+def _print_summary(result: Dict):
+    """打印智能分析结果"""
+    bitable = result["bitable"]
+    table = result["current_table"]
+    analysis = result["field_analysis"]
+    samples = result["sample_records"]
+    
+    print(f"\n{'='*70}")
+    print(f"📊 多维表格智能分析: {bitable['name']}")
+    print(f"{'='*70}")
+    
+    print(f"\n【📋 基本信息】")
+    print(f"  数据表数量: {bitable['table_count']}")
+    print(f"\n  所有数据表:")
+    for t in bitable['tables']:
+        current = " ← 当前" if t['id'] == table['table_id'] else ""
+        print(f"    • {t['name']} (ID: {t['id']}){current}")
+    
+    print(f"\n【📑 当前表: {table['name']}】")
+    print(f"  记录数: {table['record_count']} | 字段数: {table['field_count']}")
+    
+    print(f"\n【🔍 字段智能分类】")
+    if analysis.get("primary_field"):
+        print(f"  🎯 主字段: {analysis['primary_field']}")
+    if analysis.get("status_fields"):
+        print(f"  🚦 状态字段: {', '.join(analysis['status_fields'])}")
+    if analysis.get("category_fields"):
+        print(f"  🏷️  分类字段: {', '.join(analysis['category_fields'])}")
+    if analysis.get("person_fields"):
+        print(f"  👤 人员字段: {', '.join(analysis['person_fields'])}")
+    if analysis.get("date_fields"):
+        print(f"  📅 日期字段: {', '.join(analysis['date_fields'])}")
+    if analysis.get("content_fields"):
+        print(f"  📝 内容字段: {', '.join(analysis['content_fields'])}")
+    
+    print(f"\n【📋 完整字段列表】")
+    for f in table['fields']:
+        primary = " [主字段]" if f['is_primary'] else ""
+        print(f"    • {f['name']} ({f['type']}){primary}")
+    
+    print(f"\n【📊 样本数据】({len(samples)}条)")
+    for i, r in enumerate(samples, 1):
+        print(f"\n  记录 {i}:")
+        for k, v in r['fields'].items():
+            v_str = str(v)
+            if len(v_str) > 80:
+                v_str = v_str[:77] + "..."
+            print(f"    {k}: {v_str}")
+    
+    print(f"\n【💡 推荐查询】")
+    if analysis.get("filterable_fields"):
+        f = analysis["filterable_fields"][0]
+        print(f"  • 按条件筛选: bitable query \"<URL>\" --filter \"{f}=值\"")
+    if analysis.get("content_fields"):
+        f = analysis["content_fields"][0]
+        print(f"  • 模糊搜索: bitable query \"<URL>\" --filter \"{f}:关键词\"")
+    print(f"  • 导出数据: bitable export \"<URL>\" output.json")
+    
+    print(f"\n{'='*70}")
+
+
+def _handle_analyze(client: BitableClient, args):
+    """深度分析多维表格 - Phase 1 专业级增强"""
+    import time
+    start_time = time.time()
+    
+    ref = client.resolve_url(args.url)
+    sample_size = getattr(args, 'sample_size', 100)
+    
+    # 获取基本信息
+    app = client.apps.get_metadata(ref.app_token)
+    tables = client.apps.list_tables(ref.app_token)
+    table = next((t for t in tables if t.table_id == ref.table_id), None)
+    fields = client.fields.get_schema(ref.app_token, ref.table_id)
+    record_count = client.records.count(ref.app_token, ref.table_id)
+    
+    # 获取样本数据进行深度分析
+    samples = []
+    if record_count > 0:
+        sample_result = client.records.search(
+            ref.app_token, ref.table_id, 
+            page_size=min(sample_size, 500)
+        )
+        samples = sample_result.items
+    
+    # 深度字段分析
+    field_stats = _analyze_field_statistics(fields, samples, record_count)
+    
+    # 构建结果
+    result = {
+        "bitable": {
+            "name": app.name,
+            "app_token": ref.app_token,
+            "table_count": len(tables),
+            "tables": [{"name": t.table_name, "id": t.table_id} for t in tables],
+        },
+        "current_table": {
+            "name": table.table_name if table else "Unknown",
+            "table_id": ref.table_id,
+            "record_count": record_count,
+            "field_count": len(fields),
+            "fields": [{"name": f.field_name, "type": f.type.name, "is_primary": f.is_primary} for f in fields],
+        },
+        "field_statistics": field_stats,
+        "sample_records": [{"record_id": r.record_id, "fields": r.fields} for r in samples[:5]],
+        "analysis_time_ms": int((time.time() - start_time) * 1000),
+    }
+    
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        _print_analyze(result)
+
+
+def _analyze_field_statistics(fields: List[Field], samples: List[Record], total_count: int) -> Dict:
+    """深度分析字段统计信息"""
+    stats = {
+        "fields": [],
+        "recommendations": [],
+    }
+    
+    for field in fields:
+        field_stat = {
+            "name": field.field_name,
+            "type": field.type.name,
+            "is_primary": field.is_primary,
+            "category": _categorize_field(field),
+        }
+        
+        # 如果有样本数据，进行统计分析
+        if samples:
+            values = [r.fields.get(field.field_name) for r in samples if r.fields.get(field.field_name) is not None]
+            field_stat["sample_count"] = len(values)
+            field_stat["fill_rate"] = f"{len(values) / len(samples) * 100:.1f}%"
+            
+            # 文本字段统计
+            if field.type == FieldType.TEXT and values:
+                text_lengths = [len(str(v)) for v in values if v]
+                if text_lengths:
+                    field_stat["avg_length"] = sum(text_lengths) // len(text_lengths)
+                    field_stat["max_length"] = max(text_lengths)
+                    # 判断是否适合存储大文本
+                    if field_stat["avg_length"] > 1000:
+                        field_stat["note"] = "适合存储大段文本（如文档、代码）"
+            
+            # 单选/多选字段统计
+            if field.type in (FieldType.SINGLE_SELECT, FieldType.MULTI_SELECT) and values:
+                from collections import Counter
+                all_options = []
+                for v in values:
+                    if isinstance(v, list):
+                        all_options.extend([str(item) for item in v])
+                    elif v:
+                        all_options.append(str(v))
+                
+                if all_options:
+                    top_options = Counter(all_options).most_common(5)
+                    field_stat["top_values"] = [{"value": v, "count": c} for v, c in top_options]
+            
+            # 人员字段统计
+            if field.type == FieldType.USER and values:
+                users = [str(v) for v in values if v]
+                if users:
+                    from collections import Counter
+                    top_users = Counter(users).most_common(5)
+                    field_stat["top_users"] = [{"user": u, "count": c} for u, c in top_users]
+        
+        stats["fields"].append(field_stat)
+    
+    # 生成建议
+    text_fields = [f for f in stats["fields"] if f["type"] == "TEXT" and f.get("avg_length", 0) > 500]
+    if text_fields:
+        stats["recommendations"].append({
+            "type": "large_text_storage",
+            "message": f"检测到 {len(text_fields)} 个大文本字段，可充分利用多维表格存储长文档",
+            "fields": [f["name"] for f in text_fields],
+        })
+    
+    filterable = [f for f in stats["fields"] if f["category"] in ("status", "category", "person")]
+    if filterable:
+        stats["recommendations"].append({
+            "type": "filter_suggestion",
+            "message": f"建议优先使用这些字段进行筛选: {', '.join(f['name'] for f in filterable[:3])}",
+        })
+    
+    return stats
+
+
+def _categorize_field(field: Field) -> str:
+    """对字段进行分类"""
+    name_lower = field.field_name.lower()
+    
+    if field.is_primary:
+        return "primary"
+    if any(kw in name_lower for kw in ["状态", "status", "进度", "stage"]):
+        return "status"
+    if any(kw in name_lower for kw in ["类型", "分类", "category", "优先级", "priority", "标签"]):
+        return "category"
+    if any(kw in name_lower for kw in ["日期", "时间", "date", "time", "deadline"]):
+        return "date"
+    if any(kw in name_lower for kw in ["人", "负责人", "owner", "assignee", "创建人", "更新人"]):
+        return "person"
+    if field.type == FieldType.TEXT:
+        if any(kw in name_lower for kw in ["描述", "内容", "详情", "content", "正文", "文档"]):
+            return "content"
+        if any(kw in name_lower for kw in ["名", "标题", "title", "subject"]):
+            return "title"
+    return "other"
+
+
+def _print_analyze(result: Dict):
+    """打印深度分析结果"""
+    bitable = result["bitable"]
+    table = result["current_table"]
+    field_stats = result["field_statistics"]
+    samples = result["sample_records"]
+    
+    print(f"\n{'='*80}")
+    print(f"📊 多维表格深度分析: {bitable['name']}")
+    print(f"{'='*80}")
+    
+    # 基本信息
+    print(f"\n【📋 基本信息】")
+    print(f"  数据表数量: {bitable['table_count']}")
+    print(f"\n  所有数据表:")
+    for t in bitable['tables']:
+        current = " ← 当前" if t['id'] == table['table_id'] else ""
+        print(f"    • {t['name']} (ID: {t['id']}){current}")
+    
+    # 当前表信息
+    print(f"\n【📑 当前表: {table['name']}】")
+    print(f"  记录数: {table['record_count']:,} | 字段数: {table['field_count']}")
+    
+    # 字段深度分析
+    print(f"\n【🔍 字段深度分析】")
+    print(f"  {'字段名':<20} {'类型':<15} {'填充率':<10} {'统计信息':<30}")
+    print(f"  {'-'*80}")
+    
+    for f in field_stats["fields"]:
+        fill_rate = f.get("fill_rate", "N/A")
+        extra = ""
+        
+        if f.get("avg_length"):
+            extra = f"平均{f['avg_length']}字"
+            if f.get("max_length", 0) > 10000:
+                extra += " | 支持大文本"
+        elif f.get("top_values"):
+            top = f["top_values"][0]
+            extra = f"高频: {top['value'][:15]}({top['count']}次)"
+        
+        category_icon = {
+            "primary": "🎯", "status": "🚦", "category": "🏷️",
+            "date": "📅", "person": "👤", "content": "📝",
+            "title": "📌", "other": "📎"
+        }.get(f["category"], "📎")
+        
+        print(f"  {category_icon} {f['name']:<17} {f['type']:<15} {fill_rate:<10} {extra:<30}")
+    
+    # 智能建议
+    if field_stats.get("recommendations"):
+        print(f"\n【💡 智能建议】")
+        for rec in field_stats["recommendations"]:
+            print(f"  • {rec['message']}")
+    
+    # 查询建议
+    print(f"\n【🔎 推荐查询方式】")
+    filterable = [f for f in field_stats["fields"] if f["category"] in ("status", "category", "person")]
+    if filterable:
+        f = filterable[0]
+        print(f"  • 精确筛选: bitable query \"<URL>\" --filter \"{f['name']}=值\"")
+    
+    content_fields = [f for f in field_stats["fields"] if f["category"] == "content"]
+    if content_fields:
+        f = content_fields[0]
+        print(f"  • 模糊搜索: bitable query \"<URL>\" --filter \"{f['name']}:关键词\"")
+    
+    print(f"  • 分页获取: bitable query \"<URL>\" --limit 100")
+    print(f"  • 统计分析: bitable count \"<URL>\" --filter \"状态=进行中\"")
+    
+    # 样本数据
+    if samples:
+        print(f"\n【📊 样本数据】({len(samples)}条)")
+        for i, r in enumerate(samples[:3], 1):
+            print(f"\n  记录 {i}:")
+            for k, v in r['fields'].items():
+                v_str = str(v)
+                if len(v_str) > 100:
+                    v_str = v_str[:97] + "..."
+                print(f"    {k}: {v_str}")
+    
+    print(f"\n{'='*80}")
+
+
+def _handle_export(client: BitableClient, args):
+    """处理导出命令"""
+    ref = client.resolve_url(args.url)
+    filter_obj = _build_filter(args.filter)
+    
+    if args.format == "json":
+        records = []
+        for record in client.records.iter_all(ref.app_token, ref.table_id, filter=filter_obj):
+            records.append({"record_id": record.record_id, "fields": record.fields})
+        
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+        print(f"已导出 {len(records)} 条记录到 {args.output}")
+    
+    else:  # csv
+        fields = client.fields.get_schema(ref.app_token, ref.table_id)
+        field_names = [f.field_name for f in fields]
+        
+        count = 0
+        with open(args.output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["record_id"] + field_names)
+            writer.writeheader()
+            
+            for record in client.records.iter_all(ref.app_token, ref.table_id, filter=filter_obj):
+                row = {"record_id": record.record_id}
+                for field_name in field_names:
+                    value = record.fields.get(field_name, "")
+                    if isinstance(value, list):
+                        value = ", ".join(str(v) for v in value)
+                    row[field_name] = value
+                writer.writerow(row)
+                count += 1
+        
+        print(f"已导出 {count} 条记录到 {args.output}")
+
+
+if __name__ == "__main__":
+    main()
