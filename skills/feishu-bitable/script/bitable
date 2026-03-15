@@ -15,17 +15,29 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
+import subprocess
 import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, TypeVar, Generic
 
-import requests
+try:
+    import requests
+except ImportError:
+    print("正在尝试自动安装依赖 'requests'...", file=sys.stderr)
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+        import requests
+        print("依赖安装成功", file=sys.stderr)
+    except Exception as e:
+        print(f"自动安装失败: {e}", file=sys.stderr)
+        print("请尝试手动运行: python3 -m pip install requests", file=sys.stderr)
+        sys.exit(1)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 数据模型
@@ -153,7 +165,8 @@ class FilterCondition:
             if isinstance(self.value, list):
                 result["value"] = self.value
             else:
-                result["value"] = [str(self.value)]
+                # 保留原始类型（数字/布尔），只对字符串不做转换
+                result["value"] = [self.value]
         return result
 
 
@@ -298,13 +311,19 @@ def raise_for_error(response_data: Dict, log_id: Optional[str] = None):
         1254602: (RecordNotFoundError, "记录不存在"),
         1254604: (FieldNotFoundError, "字段不存在"),
         2001254291: (ConflictError, "写操作冲突，请稍后重试"),
+        1254281: (ValidationError, "URL 字段格式错误：应传 {\"link\": \"https://...\", \"text\": \"显示文字\"} 对象，而非裸字符串"),
+        1254280: (ValidationError, "字段值格式错误：请检查字段类型与传入值是否匹配"),
+        1254018: (ValidationError, "筛选条件中的字段名不存在，请先运行 analyze 确认准确字段名"),
+        1254060: (ValidationError, "文本字段应传裸字符串，不要传 [{text:..., type:...}] 数组"),
     }
 
     exc_class, default_msg = error_map.get(code, (BitableError, msg))
+    # 优先使用映射的中文提示，fallback 到 API 原始 msg
+    display_msg = default_msg if code in error_map else msg
 
     if exc_class == RateLimitError:
-        raise exc_class(msg, retry_after=60, code=code, log_id=log_id)
-    raise exc_class(msg, code=code, log_id=log_id)
+        raise exc_class(display_msg, retry_after=60, code=code, log_id=log_id)
+    raise exc_class(display_msg, code=code, log_id=log_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -346,7 +365,7 @@ class WikiResolver:
 class BitableClient:
     """飞书多维表格客户端"""
 
-    BASE_URL = "https://open.larkoffice.com/open-apis"
+    BASE_URL = "https://open.feishu.cn/open-apis"
 
     def __init__(self, app_id: Optional[str] = None, app_secret: Optional[str] = None):
         self.app_id = app_id or os.environ.get("FEISHU_APP_ID")
@@ -402,6 +421,7 @@ class BitableClient:
 
         headers = {"Authorization": f"Bearer {self._token}"}
 
+        token_refresh_count = 0
         for attempt in range(retry_count):
             try:
                 response = requests.request(
@@ -412,7 +432,19 @@ class BitableClient:
                     json=json_data,
                     timeout=60,
                 )
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except requests.exceptions.HTTPError as e:
+                    # 尝试解析错误信息
+                    try:
+                        error_data = response.json()
+                        log_id = response.headers.get("X-Log-Id")
+                        raise_for_error(error_data, log_id)
+                    except ValueError:
+                        # 如果不是标准错误格式，或解析失败，则抛出原始异常
+                        pass
+                    raise e
+
                 data = response.json()
 
                 log_id = response.headers.get("X-Log-Id")
@@ -427,17 +459,19 @@ class BitableClient:
                     continue
                 raise
             except TokenExpiredError:
+                if token_refresh_count >= 1:
+                    raise AuthenticationError("Token 刷新后仍然失效，请检查应用凭证")
+                token_refresh_count += 1
                 self._token = None
                 self._ensure_token()
                 headers["Authorization"] = f"Bearer {self._token}"
+                # 不消耗 attempt，继续当前轮次
                 continue
 
         raise ServerError(f"请求失败，已重试 {retry_count} 次")
 
     def resolve_url(self, url: str) -> BitableRef:
         """解析 URL"""
-        import re
-        
         # 检查是否为 Wiki URL
         if "/wiki/" in url:
             match = re.search(r'/wiki/([a-zA-Z0-9]+)', url)
@@ -679,6 +713,8 @@ class RecordOperations:
         self.client = client
         self._write_locks: Dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
+        self._schema_cache: Dict[str, List] = {}  # table_id -> fields
+        self._schema_cache_lock = threading.Lock()
 
     def _get_write_lock(self, table_id: str) -> threading.Lock:
         """获取表的写锁"""
@@ -687,34 +723,70 @@ class RecordOperations:
                 self._write_locks[table_id] = threading.Lock()
             return self._write_locks[table_id]
 
+    def _get_schema(self, app_token: str, table_id: str) -> List:
+        """获取字段 schema，带进程内缓存（同一次 CLI 调用内有效）"""
+        with self._schema_cache_lock:
+            if table_id not in self._schema_cache:
+                try:
+                    self._schema_cache[table_id] = self.client.fields.list(app_token, table_id)
+                except Exception:
+                    self._schema_cache[table_id] = []
+            return self._schema_cache[table_id]
+
+    def _coerce_fields(self, app_token: str, table_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """根据字段 schema 自动转换值格式，避免类型不匹配导致 API 报错"""
+        schema = self._get_schema(app_token, table_id)
+        if not schema:
+            return fields
+
+        field_type_map = {f.field_name: f.type for f in schema}
+        result = {}
+        for name, value in fields.items():
+            ftype = field_type_map.get(name)
+            if ftype == FieldType.URL and isinstance(value, str):
+                # 裸字符串自动包装为飞书 URL 对象
+                result[name] = {"link": value, "text": value}
+            elif ftype == FieldType.EMAIL and isinstance(value, str):
+                # Email 字段同样需要 link/text 对象格式
+                result[name] = {"link": value, "text": value}
+            else:
+                result[name] = value
+        return result
+
     def create(self, app_token: str, table_id: str, fields: Dict[str, Any]) -> Record:
         """创建记录"""
         url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records"
+        fields = self._coerce_fields(app_token, table_id, fields)
         payload = {"fields": fields}
 
         with self._get_write_lock(table_id):
             response = self.client._request("POST", url, json_data=payload)
-        
+
+        # create 返回 data.record（单数），search 返回 data.items（复数）
         data = response.get("data", {})
-        return self._parse_record(data)
+        return self._parse_record(data.get("record", data))
 
     def batch_create(self, app_token: str, table_id: str, records: List[Dict[str, Any]]) -> List[Record]:
         """批量创建记录"""
         url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create"
-        
+
+        # 预先拉一次 schema，后续 _coerce_fields 走缓存，不重复请求
+        self._get_schema(app_token, table_id)
+
         results = []
         # 每批最多 500 条
         for i in range(0, len(records), 500):
             batch = records[i:i+500]
-            payload = {"records": [{"fields": r} for r in batch]}
-            
+            coerced = [self._coerce_fields(app_token, table_id, r) for r in batch]
+            payload = {"records": [{"fields": r} for r in coerced]}
+
             with self._get_write_lock(table_id):
                 response = self.client._request("POST", url, json_data=payload)
-            
+
             data = response.get("data", {})
             for item in data.get("records", []):
                 results.append(self._parse_record(item))
-        
+
         return results
 
     def get(self, app_token: str, table_id: str, record_id: str) -> Record:
@@ -722,18 +794,19 @@ class RecordOperations:
         url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}"
         response = self.client._request("GET", url)
         data = response.get("data", {})
-        return self._parse_record(data)
+        return self._parse_record(data.get("record", data))
 
     def update(self, app_token: str, table_id: str, record_id: str, fields: Dict[str, Any]) -> Record:
         """更新记录"""
         url = f"{self.client.base_url}/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}"
+        fields = self._coerce_fields(app_token, table_id, fields)
         payload = {"fields": fields}
 
         with self._get_write_lock(table_id):
             response = self.client._request("PUT", url, json_data=payload)
-        
+
         data = response.get("data", {})
-        return self._parse_record(data)
+        return self._parse_record(data.get("record", data))
 
     def batch_update(self, app_token: str, table_id: str, records: List[Dict[str, Any]]) -> List[Record]:
         """批量更新记录"""
@@ -820,25 +893,15 @@ class RecordOperations:
         page_size: int = 500,
         auto_optimize: bool = True,
     ) -> Iterator[Record]:
-        """迭代所有记录（自动分页，支持动态优化）
-        
+        """迭代所有记录（自动分页）
+
         Args:
-            auto_optimize: 是否启用自动分页优化。大数据量时会动态调整 page_size
+            auto_optimize: 启用后首页用 100 条探测，后续切换到 500 条全速拉取
         """
         page_token = None
-        current_page_size = page_size
-        total_fetched = 0
-        
-        # 自适应分页策略
-        adaptive_strategy = {
-            "initial": min(page_size, 500),
-            "large_table_threshold": 10000,  # 大表阈值
-            "small_page": 100,  # 小分页（用于大表或筛选条件）
-            "normal_page": 500,  # 正常分页
-        }
-        
-        if auto_optimize:
-            current_page_size = adaptive_strategy["initial"]
+        # 首页用小 page_size 探测，避免大表首次请求超时
+        current_page_size = 100 if auto_optimize else min(page_size, 500)
+        first_page = True
 
         while True:
             result = self.search(
@@ -852,26 +915,16 @@ class RecordOperations:
 
             for record in result.items:
                 yield record
-            
-            total_fetched += len(result.items)
 
             if not result.has_more:
                 break
-            
+
             page_token = result.page_token
-            
-            # 自动优化：根据返回数据量调整 page_size
-            if auto_optimize:
-                # 如果返回记录数接近上限，说明数据量大，保持或增加 page_size
-                if len(result.items) >= current_page_size * 0.9:
-                    # 数据充足，可以使用最大分页
-                    current_page_size = adaptive_strategy["normal_page"]
-                # 如果返回记录数很少，可能是筛选条件导致，减小 page_size 避免空跑
-                elif len(result.items) < current_page_size * 0.1:
-                    current_page_size = max(adaptive_strategy["small_page"], current_page_size // 2)
-                
-                # 确保不超过 API 限制
-                current_page_size = min(current_page_size, 500)
+
+            # 首页之后切换到最大 page_size
+            if auto_optimize and first_page:
+                current_page_size = min(page_size, 500)
+                first_page = False
 
     def count(self, app_token: str, table_id: str, filter: Optional[Filter] = None) -> int:
         """统计记录数"""
@@ -895,7 +948,7 @@ class RecordOperations:
             return None
         try:
             return datetime.fromisoformat(time_str.replace("Z", "+00:00"))
-        except:
+        except (ValueError, AttributeError):
             return None
 
 
@@ -910,7 +963,7 @@ def main():
         epilog="""
 示例:
   # 库的维度（在现有多维表格内操作）
-  bitable list-tables "https://bytedance.larkoffice.com/base/xxx"
+  bitable list-tables "https://bghijixdo5.feishu.cn/base/xxx"
   bitable create-table "https://..." "任务表" --field "名称:text" --field "状态:single_select"
   bitable delete-table "https://..." --table-id "tblxxx"
 
@@ -969,15 +1022,17 @@ def main():
     create_field_parser = subparsers.add_parser("create-field", help="创建字段")
     create_field_parser.add_argument("url", help="多维表格 URL")
     create_field_parser.add_argument("name", help="字段名称")
-    create_field_parser.add_argument("type", choices=["text", "number", "single_select", "multi_select", "date", "checkbox"], help="字段类型")
+    create_field_parser.add_argument("type", choices=["text", "number", "single_select", "multi_select", "date", "checkbox", "url", "email", "phone", "rating", "progress", "currency", "percent"], help="字段类型")
     create_field_parser.add_argument("--options", help="选项（单选/多选），逗号分隔")
     create_field_parser.add_argument("--formatter", help="数字格式（如 0.00）")
+    create_field_parser.add_argument("--json", action="store_true", help="输出 JSON 格式")
 
     # update-field 命令
     update_field_parser = subparsers.add_parser("update-field", help="更新字段")
     update_field_parser.add_argument("url", help="多维表格 URL")
     update_field_parser.add_argument("--field-id", required=True, help="字段 ID")
     update_field_parser.add_argument("--name", help="新字段名")
+    update_field_parser.add_argument("--json", action="store_true", help="输出 JSON 格式")
 
     # delete-field 命令
     delete_field_parser = subparsers.add_parser("delete-field", help="删除字段")
@@ -987,16 +1042,18 @@ def main():
     # ═════════════════════════════════════════════════════════════════════════
     # 记录维度
     # ═════════════════════════════════════════════════════════════════════════
-    
+
     # create-record 命令
     create_record_parser = subparsers.add_parser("create-record", help="创建记录")
     create_record_parser.add_argument("url", help="多维表格 URL")
     create_record_parser.add_argument("--data", required=True, help="记录数据，JSON 格式")
+    create_record_parser.add_argument("--json", action="store_true", help="输出 JSON 格式（含 record_id）")
 
     # batch-create 命令
     batch_create_parser = subparsers.add_parser("batch-create", help="批量创建记录")
     batch_create_parser.add_argument("url", help="多维表格 URL")
     batch_create_parser.add_argument("--file", required=True, help="JSON 文件路径，每行一个记录")
+    batch_create_parser.add_argument("--json", action="store_true", help="输出 JSON 格式（含所有 record_id）")
 
     # get-record 命令
     get_record_parser = subparsers.add_parser("get-record", help="获取单条记录")
@@ -1076,8 +1133,39 @@ def main():
     try:
         client = BitableClient()
         handle_command(client, args)
-    except Exception as e:
+    except ValueError as e:
         print(f"错误: {e}", file=sys.stderr)
+        sys.exit(1)
+    except PermissionDeniedError as e:
+        print(f"权限错误: {e}", file=sys.stderr)
+        print("提示: 请将飞书应用添加为多维表格的协作者（编辑权限）", file=sys.stderr)
+        sys.exit(1)
+    except AuthenticationError as e:
+        print(f"认证错误: {e}", file=sys.stderr)
+        print("提示: 请检查 FEISHU_APP_ID 和 FEISHU_APP_SECRET 是否正确", file=sys.stderr)
+        sys.exit(1)
+    except ResourceNotFoundError as e:
+        print(f"资源不存在: {e}", file=sys.stderr)
+        sys.exit(1)
+    except ValidationError as e:
+        print(f"字段值格式错误: {e}", file=sys.stderr)
+        print("提示: 运行 analyze 确认字段类型，参考 SKILL.md 字段值写入格式表", file=sys.stderr)
+        sys.exit(1)
+    except RateLimitError as e:
+        print(f"请求过于频繁: {e}", file=sys.stderr)
+        print("提示: 请稍后重试", file=sys.stderr)
+        sys.exit(1)
+    except BitableError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        sys.exit(1)
+    except requests.exceptions.ConnectionError:
+        print("错误: 无法连接到飞书服务器，请检查网络", file=sys.stderr)
+        sys.exit(1)
+    except requests.exceptions.Timeout:
+        print("错误: 请求超时，请稍后重试", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"未知错误: {type(e).__name__}: {e}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -1098,10 +1186,17 @@ def handle_command(client: BitableClient, args):
         fields = []
         if args.field:
             for f in args.field:
+                if ":" not in f:
+                    print(f"错误: 字段定义格式不正确 '{f}'，应为 '字段名:类型'（如 '标题:text'）", file=sys.stderr)
+                    sys.exit(1)
                 name, type_str = f.split(":", 1)
-                field_type, ui_type = _parse_field_type(type_str)
-                fields.append(Field(field_id="", field_name=name, type=field_type, ui_type=ui_type))
-        
+                try:
+                    field_type, ui_type = _parse_field_type(type_str.strip())
+                except ValueError as e:
+                    print(f"错误: {e}", file=sys.stderr)
+                    sys.exit(1)
+                fields.append(Field(field_id="", field_name=name.strip(), type=field_type, ui_type=ui_type))
+
         table = client.tables.create(ref.app_token, args.name, fields, args.description)
         print(f"创建成功: {table.table_name}")
         print(f"Table ID: {table.table_id}")
@@ -1119,56 +1214,97 @@ def handle_command(client: BitableClient, args):
     # 字段维度
     elif command == "create-field":
         ref = client.resolve_url(args.url)
-        field_type, ui_type = _parse_field_type(args.type)
-        
+        _require_table_id(ref)
+        try:
+            field_type, ui_type = _parse_field_type(args.type)
+        except ValueError as e:
+            print(f"错误: {e}", file=sys.stderr)
+            sys.exit(1)
+
         property = {}
         if args.type in ["single_select", "multi_select"] and args.options:
             options = [{"name": o.strip()} for o in args.options.split(",")]
             property = {"options": options}
         if args.type == "number" and args.formatter:
             property = {"formatter": args.formatter}
-        
+
         field = client.fields.create(ref.app_token, ref.table_id, args.name, field_type, ui_type, property)
-        print(f"创建成功: {field.field_name}")
-        print(f"Field ID: {field.field_id}")
+        if getattr(args, 'json', False):
+            print(json.dumps({"field_id": field.field_id, "field_name": field.field_name, "type": field.type.name}, ensure_ascii=False))
+        else:
+            print(f"创建成功: {field.field_name}")
+            print(f"Field ID: {field.field_id}")
 
     elif command == "update-field":
         ref = client.resolve_url(args.url)
-        client.fields.update(ref.app_token, ref.table_id, args.field_id, args.name)
-        print("更新成功")
+        _require_table_id(ref)
+        updated = client.fields.update(ref.app_token, ref.table_id, args.field_id, args.name)
+        if getattr(args, 'json', False):
+            print(json.dumps({"field_id": updated.field_id, "field_name": updated.field_name}, ensure_ascii=False))
+        else:
+            print("更新成功")
 
     elif command == "delete-field":
         ref = client.resolve_url(args.url)
+        _require_table_id(ref)
         client.fields.delete(ref.app_token, ref.table_id, args.field_id)
         print("删除成功")
 
     # 记录维度
     elif command == "create-record":
         ref = client.resolve_url(args.url)
-        data = json.loads(args.data)
+        _require_table_id(ref)
+        try:
+            data = json.loads(args.data)
+        except json.JSONDecodeError as e:
+            print(f"错误: --data 参数不是有效的 JSON: {e}", file=sys.stderr)
+            sys.exit(1)
         record = client.records.create(ref.app_token, ref.table_id, data)
-        print(f"创建成功: {record.record_id}")
+        if getattr(args, 'json', False):
+            print(json.dumps({"record_id": record.record_id}, ensure_ascii=False))
+        else:
+            print(f"创建成功: {record.record_id}")
 
     elif command == "batch-create":
         ref = client.resolve_url(args.url)
+        _require_table_id(ref)
+        records = []
         with open(args.file, "r", encoding="utf-8") as f:
-            records = [json.loads(line) for line in f if line.strip()]
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(f"错误: 第 {line_num} 行不是有效的 JSON: {e}", file=sys.stderr)
+                    sys.exit(1)
         results = client.records.batch_create(ref.app_token, ref.table_id, records)
-        print(f"创建成功: {len(results)} 条记录")
+        if getattr(args, 'json', False):
+            print(json.dumps({"count": len(results), "record_ids": [r.record_id for r in results]}, ensure_ascii=False))
+        else:
+            print(f"创建成功: {len(results)} 条记录")
 
     elif command == "get-record":
         ref = client.resolve_url(args.url)
+        _require_table_id(ref)
         record = client.records.get(ref.app_token, ref.table_id, args.record_id)
         print(json.dumps({"record_id": record.record_id, "fields": record.fields}, ensure_ascii=False, indent=2))
 
     elif command == "update-record":
         ref = client.resolve_url(args.url)
-        data = json.loads(args.data)
+        _require_table_id(ref)
+        try:
+            data = json.loads(args.data)
+        except json.JSONDecodeError as e:
+            print(f"错误: --data 参数不是有效的 JSON: {e}", file=sys.stderr)
+            sys.exit(1)
         record = client.records.update(ref.app_token, ref.table_id, args.record_id, data)
         print(f"更新成功: {record.record_id}")
 
     elif command == "delete-record":
         ref = client.resolve_url(args.url)
+        _require_table_id(ref)
         client.records.delete(ref.app_token, ref.table_id, args.record_id)
         print("删除成功")
 
@@ -1181,9 +1317,10 @@ def handle_command(client: BitableClient, args):
 
     elif command == "count":
         ref = client.resolve_url(args.url)
+        _require_table_id(ref)
         filter_obj = _build_filter(args.filter) if args.filter else None
         count = client.records.count(ref.app_token, ref.table_id, filter=filter_obj)
-        print(count)
+        print(f"记录总数: {count}")
 
     elif command == "smart-query":
         _handle_smart_query(client, args)
@@ -1209,24 +1346,68 @@ def _parse_field_type(type_str: str) -> tuple:
         "multi_select": (FieldType.MULTI_SELECT, UIType.MULTI_SELECT),
         "date": (FieldType.DATE, UIType.DATE),
         "checkbox": (FieldType.CHECKBOX, UIType.CHECKBOX),
+        "url": (FieldType.URL, UIType.URL),
+        "email": (FieldType.EMAIL, UIType.EMAIL),
+        "phone": (FieldType.PHONE, UIType.PHONE),
+        "rating": (FieldType.RATING, UIType.RATING),
+        "progress": (FieldType.PROGRESS, UIType.PROGRESS),
+        "currency": (FieldType.CURRENCY, UIType.CURRENCY),
+        "percent": (FieldType.PERCENT, UIType.PERCENT),
     }
-    return type_map.get(type_str, (FieldType.TEXT, UIType.TEXT))
+    result = type_map.get(type_str)
+    if result is None:
+        valid = ", ".join(sorted(type_map.keys()))
+        raise ValueError(f"不支持的字段类型 '{type_str}'，可用类型: {valid}")
+    return result
+
+
+def _require_table_id(ref):
+    """校验 URL 中包含 table_id"""
+    if not ref.table_id:
+        print("错误: URL 中缺少 table 参数，请使用包含 ?table=tblXXX 的完整 URL", file=sys.stderr)
+        sys.exit(1)
 
 
 def _build_filter(filter_args: List[str]) -> Optional[Filter]:
-    """构建筛选条件"""
+    """构建筛选条件
+
+    格式：
+      字段名=值   → 精确匹配（EQUALS）
+      字段名:值   → 包含匹配（CONTAINS）
+
+    字段名本身含 = 或 : 时，用反斜杠转义：字段\\=名=值
+    """
     if not filter_args:
         return None
-    
+
     conditions = []
     for f in filter_args:
-        if "=" in f:
-            field, value = f.split("=", 1)
-            conditions.append(FilterCondition(field, Operator.EQUALS, value))
-        elif ":" in f:
-            field, value = f.split(":", 1)
-            conditions.append(FilterCondition(field, Operator.CONTAINS, value))
-    
+        # 找第一个未转义的 = 或 :
+        op = None
+        split_pos = -1
+        i = 0
+        while i < len(f):
+            if f[i] == '\\' and i + 1 < len(f) and f[i+1] in ('=', ':'):
+                i += 2  # 跳过转义字符
+                continue
+            if f[i] == '=' and op is None:
+                op = Operator.EQUALS
+                split_pos = i
+                break
+            if f[i] == ':' and op is None:
+                op = Operator.CONTAINS
+                split_pos = i
+                break
+            i += 1
+
+        if op is None or split_pos < 1:
+            print(f"警告: 忽略无效筛选条件 '{f}'，格式应为 '字段名=值' 或 '字段名:值'", file=sys.stderr)
+            continue
+
+        field_name = f[:split_pos].replace('\\=', '=').replace('\\:', ':')
+        value = f[split_pos+1:]
+        conditions.append(FilterCondition(field_name, op, value))
+
     if conditions:
         return Filter.and_(*conditions)
     return None
@@ -1234,7 +1415,6 @@ def _build_filter(filter_args: List[str]) -> Optional[Filter]:
 
 def _handle_health_check(client: BitableClient, args):
     """健康检查 - Phase 1 专业级增强"""
-    import time
     start_time = time.time()
     
     result = {
@@ -1399,10 +1579,52 @@ def _print_health_check(result: Dict):
     print(f"{'='*70}")
 
 
+def _serialize_field_value(value: Any) -> str:
+    """将字段值序列化为人类可读字符串（用于终端输出和 CSV 导出）"""
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                # 富文本 [{text: "...", type: "text"}]
+                if "text" in item:
+                    parts.append(str(item["text"]))
+                # 人员 [{id: "...", name: "..."}]
+                elif "name" in item:
+                    parts.append(str(item["name"]))
+                # 附件 [{name: "...", file_token: "..."}]
+                elif "file_token" in item:
+                    parts.append(item.get("name", item.get("file_token", "")))
+                else:
+                    parts.append(json.dumps(item, ensure_ascii=False))
+            else:
+                parts.append(str(item))
+        return ", ".join(parts)
+    if isinstance(value, dict):
+        # URL/Email 字段 {"link": "...", "text": "..."}
+        if "link" in value:
+            text = value.get("text", "")
+            link = value["link"]
+            return f"{text} ({link})" if text and text != link else link
+        # 地理位置
+        if "location" in value:
+            return value.get("location", "")
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
 def _handle_query(client: BitableClient, args):
     """处理查询命令"""
     ref = client.resolve_url(args.url)
-    filter_obj = _build_filter(args.filter)
+    _require_table_id(ref)
+    filter_obj = _build_filter(args.filter) if args.filter else None
     
     records = []
     count = 0
@@ -1424,17 +1646,16 @@ def _handle_query(client: BitableClient, args):
         for i, r in enumerate(records, 1):
             print(f"\n  记录 {i} (ID: {r['record_id']}):")
             for k, v in r['fields'].items():
-                v_str = str(v)
-                if len(v_str) > 80:
-                    v_str = v_str[:77] + "..."
+                v_str = _serialize_field_value(v)
+                if len(v_str) > 120:
+                    v_str = v_str[:117] + "..."
                 print(f"    {k}: {v_str}")
 
 
 def _handle_smart_query(client: BitableClient, args):
     """自然语言智能查询"""
-    import re
-    
     ref = client.resolve_url(args.url)
+    _require_table_id(ref)
     query_text = args.query
     
     # 获取表结构
@@ -1477,7 +1698,7 @@ def _handle_smart_query(client: BitableClient, args):
     if not selected_fields:
         # 优先返回内容字段 + 人员字段 + 日期字段
         for f in fields:
-            category = _categorize_field_for_smart_query(f)
+            category = _categorize_field(f)
             if category in ("content", "person", "date", "title"):
                 selected_fields.append(f.field_name)
         # 限制字段数量
@@ -1519,46 +1740,47 @@ def _handle_smart_query(client: BitableClient, args):
         for i, r in enumerate(records, 1):
             print(f"\n  记录 {i}:")
             for k, v in r['fields'].items():
-                v_str = str(v)
-                if len(v_str) > 100:
-                    v_str = v_str[:97] + "..."
+                v_str = _serialize_field_value(v)
+                if len(v_str) > 120:
+                    v_str = v_str[:117] + "..."
                 print(f"    {k}: {v_str}")
 
 
 def _parse_natural_language(query: str, field_names: List[str]) -> Dict:
     """解析自然语言查询"""
     conditions = []
-    query_lower = query.lower()
-    
-    # 模式 1: "查找/搜索/获取 ... 关于 ... 的 ..."
+
+    # 模式 1: "查找/搜索/找 <人名> 关于 <关键词> 的 ..."
+    # 人名必须在 "关于" 之前，且不能是空字符串
     # 示例: "查找张三关于 openclaw 的讨论"
-    person_pattern = r"(?:查找|搜索|获取|找)\s*(.+?)(?:关于|的|在)"
-    content_pattern = r"关于\s*(.+?)(?:的|讨论|记录|内容)"
-    
+    person_pattern = r"(?:查找|搜索|获取|找)\s*([^\s关于]{1,20}?)\s*(?:关于|发的|写的|提到)"
+    content_pattern = r"关于\s*(.+?)(?:\s*的|讨论|记录|内容|$)"
+
     person_match = re.search(person_pattern, query)
     content_match = re.search(content_pattern, query)
-    
+
     if person_match:
         person_name = person_match.group(1).strip()
-        # 匹配人员字段
-        person_field = _find_best_field_match(field_names, ["人", "负责人", "发送人", "作者", "owner", "assignee"])
-        if person_field:
-            conditions.append({
-                "type": "person",
-                "field": person_field,
-                "value": person_name,
-            })
-    
+        # 过滤掉明显不是人名的匹配（如纯标点、过短）
+        if person_name and len(person_name) >= 2:
+            person_field = _find_best_field_match(field_names, ["人", "负责人", "发送人", "作者", "owner", "assignee"])
+            if person_field:
+                conditions.append({
+                    "type": "person",
+                    "field": person_field,
+                    "value": person_name,
+                })
+
     if content_match:
         content_keyword = content_match.group(1).strip()
-        # 匹配内容字段
-        content_field = _find_best_field_match(field_names, ["内容", "记录", "描述", "聊天记录", "文档", "content", "message"])
-        if content_field:
-            conditions.append({
-                "type": "content",
-                "field": content_field,
-                "value": content_keyword,
-            })
+        if content_keyword:
+            content_field = _find_best_field_match(field_names, ["内容", "记录", "描述", "聊天记录", "文档", "content", "message"])
+            if content_field:
+                conditions.append({
+                    "type": "content",
+                    "field": content_field,
+                    "value": content_keyword,
+                })
     
     # 模式 2: "状态为 ... 的 ..."
     # 示例: "状态为进行中的任务"
@@ -1619,172 +1841,12 @@ def _find_best_field_match(field_names: List[str], keywords: List[str]) -> Optio
     return None
 
 
-def _categorize_field_for_smart_query(field: Field) -> str:
-    """为智能查询分类字段"""
-    name_lower = field.field_name.lower()
-    
-    if field.is_primary:
-        return "title"
-    if field.type == FieldType.TEXT:
-        if any(kw in name_lower for kw in ["内容", "描述", "详情", "content", "正文", "文档", "记录", "聊天记录", "消息"]):
-            return "content"
-        if any(kw in name_lower for kw in ["名", "标题", "title", "subject", "名称"]):
-            return "title"
-    if any(kw in name_lower for kw in ["人", "负责人", "owner", "assignee", "创建人", "更新人", "发送人", "作者"]):
-        return "person"
-    if any(kw in name_lower for kw in ["日期", "时间", "date", "time", "deadline", "created", "updated"]):
-        return "date"
-    if any(kw in name_lower for kw in ["状态", "status", "进度", "stage", "类型", "分类", "category"]):
-        return "status"
-    return "other"
-
-
-def _handle_summary(client: BitableClient, args):
-    """处理智能分析命令"""
-    ref = client.resolve_url(args.url)
-    
-    # 获取基本信息
-    app = client.apps.get_metadata(ref.app_token)
-    tables = client.apps.list_tables(ref.app_token)
-    
-    # 获取当前表信息
-    table = next((t for t in tables if t.table_id == ref.table_id), None)
-    fields = client.fields.get_schema(ref.app_token, ref.table_id)
-    record_count = client.records.count(ref.app_token, ref.table_id)
-    
-    # 获取样本记录
-    samples_result = client.records.search(ref.app_token, ref.table_id, page_size=5)
-    samples = samples_result.items
-    
-    # 智能字段分析
-    field_analysis = _analyze_fields(fields, samples)
-    
-    result = {
-        "bitable": {
-            "name": app.name,
-            "app_token": ref.app_token,
-            "table_count": len(tables),
-            "tables": [{"name": t.table_name, "id": t.table_id} for t in tables],
-        },
-        "current_table": {
-            "name": table.table_name if table else "Unknown",
-            "table_id": ref.table_id,
-            "record_count": record_count,
-            "field_count": len(fields),
-            "fields": [{"name": f.field_name, "type": f.type.name, "is_primary": f.is_primary} for f in fields],
-        },
-        "field_analysis": field_analysis,
-        "sample_records": [{"record_id": r.record_id, "fields": r.fields} for r in samples],
-    }
-    
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-    else:
-        _print_summary(result)
-
-
-def _analyze_fields(fields: List[Field], samples: List[Record]) -> Dict:
-    """智能分析字段"""
-    analysis = {
-        "primary_field": None,
-        "status_fields": [],
-        "category_fields": [],
-        "date_fields": [],
-        "person_fields": [],
-        "content_fields": [],
-        "filterable_fields": [],
-    }
-    
-    for f in fields:
-        if f.is_primary:
-            analysis["primary_field"] = f.field_name
-        
-        name_lower = f.field_name.lower()
-        
-        if any(kw in name_lower for kw in ["状态", "status", "进度", "stage"]):
-            analysis["status_fields"].append(f.field_name)
-            analysis["filterable_fields"].append(f.field_name)
-        elif any(kw in name_lower for kw in ["类型", "分类", "category", "优先级", "priority"]):
-            analysis["category_fields"].append(f.field_name)
-            analysis["filterable_fields"].append(f.field_name)
-        elif any(kw in name_lower for kw in ["日期", "时间", "date", "time"]):
-            analysis["date_fields"].append(f.field_name)
-        elif any(kw in name_lower for kw in ["人", "负责人", "owner", "assignee"]):
-            analysis["person_fields"].append(f.field_name)
-            analysis["filterable_fields"].append(f.field_name)
-        elif f.type == FieldType.TEXT and any(kw in name_lower for kw in ["名", "标题", "描述", "content"]):
-            analysis["content_fields"].append(f.field_name)
-    
-    return analysis
-
-
-def _print_summary(result: Dict):
-    """打印智能分析结果"""
-    bitable = result["bitable"]
-    table = result["current_table"]
-    analysis = result["field_analysis"]
-    samples = result["sample_records"]
-    
-    print(f"\n{'='*70}")
-    print(f"📊 多维表格智能分析: {bitable['name']}")
-    print(f"{'='*70}")
-    
-    print(f"\n【📋 基本信息】")
-    print(f"  数据表数量: {bitable['table_count']}")
-    print(f"\n  所有数据表:")
-    for t in bitable['tables']:
-        current = " ← 当前" if t['id'] == table['table_id'] else ""
-        print(f"    • {t['name']} (ID: {t['id']}){current}")
-    
-    print(f"\n【📑 当前表: {table['name']}】")
-    print(f"  记录数: {table['record_count']} | 字段数: {table['field_count']}")
-    
-    print(f"\n【🔍 字段智能分类】")
-    if analysis.get("primary_field"):
-        print(f"  🎯 主字段: {analysis['primary_field']}")
-    if analysis.get("status_fields"):
-        print(f"  🚦 状态字段: {', '.join(analysis['status_fields'])}")
-    if analysis.get("category_fields"):
-        print(f"  🏷️  分类字段: {', '.join(analysis['category_fields'])}")
-    if analysis.get("person_fields"):
-        print(f"  👤 人员字段: {', '.join(analysis['person_fields'])}")
-    if analysis.get("date_fields"):
-        print(f"  📅 日期字段: {', '.join(analysis['date_fields'])}")
-    if analysis.get("content_fields"):
-        print(f"  📝 内容字段: {', '.join(analysis['content_fields'])}")
-    
-    print(f"\n【📋 完整字段列表】")
-    for f in table['fields']:
-        primary = " [主字段]" if f['is_primary'] else ""
-        print(f"    • {f['name']} ({f['type']}){primary}")
-    
-    print(f"\n【📊 样本数据】({len(samples)}条)")
-    for i, r in enumerate(samples, 1):
-        print(f"\n  记录 {i}:")
-        for k, v in r['fields'].items():
-            v_str = str(v)
-            if len(v_str) > 80:
-                v_str = v_str[:77] + "..."
-            print(f"    {k}: {v_str}")
-    
-    print(f"\n【💡 推荐查询】")
-    if analysis.get("filterable_fields"):
-        f = analysis["filterable_fields"][0]
-        print(f"  • 按条件筛选: bitable query \"<URL>\" --filter \"{f}=值\"")
-    if analysis.get("content_fields"):
-        f = analysis["content_fields"][0]
-        print(f"  • 模糊搜索: bitable query \"<URL>\" --filter \"{f}:关键词\"")
-    print(f"  • 导出数据: bitable export \"<URL>\" output.json")
-    
-    print(f"\n{'='*70}")
-
-
 def _handle_analyze(client: BitableClient, args):
     """深度分析多维表格 - Phase 1 专业级增强"""
-    import time
     start_time = time.time()
-    
+
     ref = client.resolve_url(args.url)
+    _require_table_id(ref)
     sample_size = getattr(args, 'sample_size', 100)
     
     # 获取基本信息
@@ -1819,7 +1881,7 @@ def _handle_analyze(client: BitableClient, args):
             "table_id": ref.table_id,
             "record_count": record_count,
             "field_count": len(fields),
-            "fields": [{"name": f.field_name, "type": f.type.name, "is_primary": f.is_primary} for f in fields],
+            "fields": [{"name": f.field_name, "field_id": f.field_id, "type": f.type.name, "ui_type": f.ui_type.value, "is_primary": f.is_primary} for f in fields],
         },
         "field_statistics": field_stats,
         "sample_records": [{"record_id": r.record_id, "fields": r.fields} for r in samples[:5]],
@@ -1842,7 +1904,9 @@ def _analyze_field_statistics(fields: List[Field], samples: List[Record], total_
     for field in fields:
         field_stat = {
             "name": field.field_name,
+            "field_id": field.field_id,
             "type": field.type.name,
+            "ui_type": field.ui_type.value,
             "is_primary": field.is_primary,
             "category": _categorize_field(field),
         }
@@ -1857,31 +1921,55 @@ def _analyze_field_statistics(fields: List[Field], samples: List[Record], total_
             if field.type == FieldType.TEXT and values:
                 text_lengths = [len(str(v)) for v in values if v]
                 if text_lengths:
-                    field_stat["avg_length"] = sum(text_lengths) // len(text_lengths)
+                    field_stat["avg_length"] = round(sum(text_lengths) / len(text_lengths))
                     field_stat["max_length"] = max(text_lengths)
-                    # 判断是否适合存储大文本
                     if field_stat["avg_length"] > 1000:
                         field_stat["note"] = "适合存储大段文本（如文档、代码）"
-            
+
             # 单选/多选字段统计
             if field.type in (FieldType.SINGLE_SELECT, FieldType.MULTI_SELECT) and values:
-                from collections import Counter
                 all_options = []
                 for v in values:
                     if isinstance(v, list):
                         all_options.extend([str(item) for item in v])
                     elif v:
                         all_options.append(str(v))
-                
                 if all_options:
                     top_options = Counter(all_options).most_common(5)
                     field_stat["top_values"] = [{"value": v, "count": c} for v, c in top_options]
-            
+
+            # 数字/货币/百分比/进度/评分字段统计
+            if field.type in (FieldType.NUMBER, FieldType.CURRENCY, FieldType.PERCENT,
+                               FieldType.PROGRESS, FieldType.RATING) and values:
+                nums = [v for v in values if isinstance(v, (int, float))]
+                if nums:
+                    field_stat["min"] = min(nums)
+                    field_stat["max"] = max(nums)
+                    field_stat["avg"] = round(sum(nums) / len(nums), 2)
+
+            # URL 字段统计：展示域名分布
+            if field.type == FieldType.URL and values:
+                domains = []
+                for v in values:
+                    link = v.get("link", "") if isinstance(v, dict) else str(v)
+                    m = re.match(r'https?://([^/]+)', link)
+                    if m:
+                        domains.append(m.group(1))
+                if domains:
+                    top_domains = Counter(domains).most_common(3)
+                    field_stat["top_domains"] = [{"domain": d, "count": c} for d, c in top_domains]
+
             # 人员字段统计
             if field.type == FieldType.USER and values:
-                users = [str(v) for v in values if v]
+                users = []
+                for v in values:
+                    if isinstance(v, list):
+                        for u in v:
+                            name = u.get("name", u.get("id", str(u))) if isinstance(u, dict) else str(u)
+                            users.append(name)
+                    elif v:
+                        users.append(str(v))
                 if users:
-                    from collections import Counter
                     top_users = Counter(users).most_common(5)
                     field_stat["top_users"] = [{"user": u, "count": c} for u, c in top_users]
         
@@ -1907,11 +1995,50 @@ def _analyze_field_statistics(fields: List[Field], samples: List[Record], total_
 
 
 def _categorize_field(field: Field) -> str:
-    """对字段进行分类"""
+    """对字段进行分类，优先按字段类型，再按字段名关键词"""
     name_lower = field.field_name.lower()
-    
+
     if field.is_primary:
         return "primary"
+
+    # 按字段类型优先判断
+    if field.type == FieldType.DATE:
+        return "date"
+    if field.type == FieldType.USER:
+        return "person"
+    if field.type == FieldType.CHECKBOX:
+        return "status"
+    if field.type in (FieldType.SINGLE_SELECT, FieldType.MULTI_SELECT):
+        if any(kw in name_lower for kw in ["状态", "status", "进度", "stage"]):
+            return "status"
+        return "category"
+    if field.type == FieldType.URL:
+        return "url"
+    if field.type in (FieldType.NUMBER, FieldType.CURRENCY, FieldType.PERCENT, FieldType.PROGRESS, FieldType.RATING):
+        return "number"
+    if field.type == FieldType.ATTACHMENT:
+        return "attachment"
+    if field.type in (FieldType.LINK, FieldType.DUPLEX_LINK):
+        return "link"
+    if field.type in (FieldType.FORMULA,):
+        return "formula"
+
+    # TEXT 类型按字段名细分
+    if field.type == FieldType.TEXT:
+        if any(kw in name_lower for kw in ["状态", "status", "进度", "stage"]):
+            return "status"
+        if any(kw in name_lower for kw in ["类型", "分类", "category", "优先级", "priority", "标签"]):
+            return "category"
+        if any(kw in name_lower for kw in ["日期", "时间", "date", "time", "deadline"]):
+            return "date"
+        if any(kw in name_lower for kw in ["人", "负责人", "owner", "assignee", "创建人", "更新人"]):
+            return "person"
+        if any(kw in name_lower for kw in ["描述", "内容", "详情", "说明", "备注", "content", "正文", "文档", "记录", "聊天", "note", "remark", "comment", "body", "text"]):
+            return "content"
+        if any(kw in name_lower for kw in ["名", "标题", "title", "subject", "name"]):
+            return "title"
+
+    # 兜底：按字段名关键词
     if any(kw in name_lower for kw in ["状态", "status", "进度", "stage"]):
         return "status"
     if any(kw in name_lower for kw in ["类型", "分类", "category", "优先级", "priority", "标签"]):
@@ -1920,11 +2047,7 @@ def _categorize_field(field: Field) -> str:
         return "date"
     if any(kw in name_lower for kw in ["人", "负责人", "owner", "assignee", "创建人", "更新人"]):
         return "person"
-    if field.type == FieldType.TEXT:
-        if any(kw in name_lower for kw in ["描述", "内容", "详情", "content", "正文", "文档"]):
-            return "content"
-        if any(kw in name_lower for kw in ["名", "标题", "title", "subject"]):
-            return "title"
+
     return "other"
 
 
@@ -1962,17 +2085,23 @@ def _print_analyze(result: Dict):
         
         if f.get("avg_length"):
             extra = f"平均{f['avg_length']}字"
-            if f.get("max_length", 0) > 10000:
-                extra += " | 支持大文本"
+            if f.get("avg_length", 0) > 1000:
+                extra += " | 大文本"
         elif f.get("top_values"):
             top = f["top_values"][0]
             extra = f"高频: {top['value'][:15]}({top['count']}次)"
+        elif f.get("min") is not None:
+            extra = f"范围: {f['min']}~{f['max']} 均{f['avg']}"
+        elif f.get("top_domains"):
+            extra = f"域名: {f['top_domains'][0]['domain']}"
         
         category_icon = {
             "primary": "🎯", "status": "🚦", "category": "🏷️",
             "date": "📅", "person": "👤", "content": "📝",
-            "title": "📌", "other": "📎"
-        }.get(f["category"], "📎")
+            "title": "📌", "url": "🔗", "number": "🔢",
+            "attachment": "📎", "link": "🔀", "formula": "⚡",
+            "other": "◽"
+        }.get(f["category"], "◽")
         
         print(f"  {category_icon} {f['name']:<17} {f['type']:<15} {fill_rate:<10} {extra:<30}")
     
@@ -2003,9 +2132,9 @@ def _print_analyze(result: Dict):
         for i, r in enumerate(samples[:3], 1):
             print(f"\n  记录 {i}:")
             for k, v in r['fields'].items():
-                v_str = str(v)
-                if len(v_str) > 100:
-                    v_str = v_str[:97] + "..."
+                v_str = _serialize_field_value(v)
+                if len(v_str) > 120:
+                    v_str = v_str[:117] + "..."
                 print(f"    {k}: {v_str}")
     
     print(f"\n{'='*80}")
@@ -2014,36 +2143,34 @@ def _print_analyze(result: Dict):
 def _handle_export(client: BitableClient, args):
     """处理导出命令"""
     ref = client.resolve_url(args.url)
-    filter_obj = _build_filter(args.filter)
-    
+    _require_table_id(ref)
+    filter_obj = _build_filter(args.filter) if args.filter else None
+
     if args.format == "json":
         records = []
         for record in client.records.iter_all(ref.app_token, ref.table_id, filter=filter_obj):
             records.append({"record_id": record.record_id, "fields": record.fields})
-        
+
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(records, f, ensure_ascii=False, indent=2)
         print(f"已导出 {len(records)} 条记录到 {args.output}")
-    
+
     else:  # csv
         fields = client.fields.get_schema(ref.app_token, ref.table_id)
         field_names = [f.field_name for f in fields]
-        
+
         count = 0
-        with open(args.output, "w", newline="", encoding="utf-8") as f:
+        with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=["record_id"] + field_names)
             writer.writeheader()
-            
+
             for record in client.records.iter_all(ref.app_token, ref.table_id, filter=filter_obj):
                 row = {"record_id": record.record_id}
                 for field_name in field_names:
-                    value = record.fields.get(field_name, "")
-                    if isinstance(value, list):
-                        value = ", ".join(str(v) for v in value)
-                    row[field_name] = value
+                    row[field_name] = _serialize_field_value(record.fields.get(field_name, ""))
                 writer.writerow(row)
                 count += 1
-        
+
         print(f"已导出 {count} 条记录到 {args.output}")
 
 
