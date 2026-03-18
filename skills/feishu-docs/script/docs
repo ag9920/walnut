@@ -1,0 +1,857 @@
+#!/usr/bin/env python3
+"""
+Feishu Docs CLI Tool (Refactored)
+
+A robust, agent-friendly command-line interface for managing Feishu Docs (Lark Docs).
+Supports Markdown parsing, document structure manipulation, and permission management.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import subprocess
+import urllib.parse
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# -----------------------------------------------------------------------------
+# Dependency Management
+# -----------------------------------------------------------------------------
+try:
+    import requests
+except ImportError:
+    print("Installing 'requests' dependency...", file=sys.stderr)
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+        import requests
+        print("Dependency installed successfully.", file=sys.stderr)
+    except Exception as e:
+        print(f"Failed to install dependency: {e}", file=sys.stderr)
+        sys.exit(1)
+
+# -----------------------------------------------------------------------------
+# Constants & Enums
+# -----------------------------------------------------------------------------
+
+class BlockType(Enum):
+    PAGE = 1
+    TEXT = 2
+    HEADING1 = 3
+    HEADING2 = 4
+    HEADING3 = 5
+    HEADING4 = 6
+    HEADING5 = 7
+    HEADING6 = 8
+    HEADING7 = 9
+    HEADING8 = 10
+    HEADING9 = 11
+    BULLET = 12
+    ORDERED = 13
+    CODE = 14
+    QUOTE = 15
+    TODO = 17
+    DIVIDER = 22
+    IMAGE = 27
+    TABLE = 31
+
+# -----------------------------------------------------------------------------
+# Data Models
+# -----------------------------------------------------------------------------
+
+@dataclass
+class DocInfo:
+    doc_token: str
+    title: str
+    owner_id: str
+    create_time: int = 0
+    update_time: int = 0
+    url: str = ""
+
+@dataclass
+class Block:
+    block_id: str
+    parent_id: str
+    block_type: int
+    children: List[str] = field(default_factory=list)
+    content: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+# -----------------------------------------------------------------------------
+# Feishu API Client
+# -----------------------------------------------------------------------------
+
+class FeishuClient:
+    """Handles authentication and raw API requests."""
+    
+    BASE_URL = "https://open.feishu.cn/open-apis"
+
+    def __init__(self, app_id: Optional[str] = None, app_secret: Optional[str] = None):
+        self.app_id = app_id or os.environ.get("FEISHU_APP_ID")
+        self.app_secret = app_secret or os.environ.get("FEISHU_APP_SECRET")
+        
+        if not self.app_id or not self.app_secret:
+            raise ValueError("Missing credentials. Set FEISHU_APP_ID/FEISHU_APP_SECRET env vars or pass arguments.")
+
+        self._token: Optional[str] = None
+        self._token_expires_at: float = 0
+
+    def _get_tenant_access_token(self) -> Tuple[str, int]:
+        """Fetch a new tenant access token."""
+        url = f"{self.BASE_URL}/auth/v3/tenant_access_token/internal"
+        payload = {"app_id": self.app_id, "app_secret": self.app_secret}
+        
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            raise RuntimeError(f"Failed to connect to auth endpoint: {e}")
+
+        if data.get("code") != 0:
+            raise RuntimeError(f"Auth failed: {data.get('msg')} (Code: {data.get('code')})")
+            
+        return data["tenant_access_token"], data.get("expire", 7200)
+
+    def _ensure_token(self):
+        """Ensure we have a valid token, refreshing if necessary."""
+        now = time.time()
+        # Refresh if token is missing or expires in less than 5 minutes
+        if self._token is None or now >= self._token_expires_at - 300:
+            token, expires_in = self._get_tenant_access_token()
+            self._token = token
+            self._token_expires_at = now + expires_in
+
+    def request(self, method: str, path: str, params: Optional[Dict] = None, json_data: Optional[Dict] = None) -> Dict:
+        """Execute an authenticated API request."""
+        self._ensure_token()
+        url = f"{self.BASE_URL}{path}"
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+        
+        try:
+            response = requests.request(method, url, headers=headers, params=params, json=json_data, timeout=30)
+            
+            # Check for HTTP errors
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                # Try to parse error details from body
+                try:
+                    err_body = response.json()
+                    log_id = response.headers.get('X-Log-Id', 'unknown')
+                    raise RuntimeError(f"API Error {err_body.get('code')}: {err_body.get('msg')} (LogID: {log_id})")
+                except ValueError:
+                    # If not JSON, just raise the HTTP error
+                    raise e
+
+            # Parse success response
+            if response.status_code == 204:
+                return {}
+            
+            try:
+                data = response.json()
+            except ValueError:
+                # Some 200 OK responses might be empty?
+                return {}
+
+            if data.get("code") != 0:
+                log_id = response.headers.get('X-Log-Id', 'unknown')
+                raise RuntimeError(f"API Error {data.get('code')}: {data.get('msg')} (LogID: {log_id})")
+            
+            return data
+
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Network request failed: {e}")
+
+    def resolve_wiki_token(self, wiki_token: str) -> str:
+        """Resolve a Wiki token to its underlying Doc/Docx token."""
+        path = "/wiki/v2/spaces/get_node"
+        params = {"token": wiki_token}
+        data = self.request("GET", path, params=params)
+        node = data.get("data", {}).get("node", {})
+        obj_type = node.get("obj_type", "")
+        
+        if obj_type not in ["doc", "docx"]:
+            raise ValueError(f"Wiki node is type '{obj_type}', expected 'doc' or 'docx'.")
+            
+        return node.get("obj_token")
+
+    @staticmethod
+    def extract_token(url_or_token: str, client: Optional['FeishuClient'] = None) -> str:
+        """
+        Extract the object token from a URL or return the token itself.
+        Handles:
+        - feishu.cn/docx/<token>
+        - feishu.cn/wiki/<token> (requires client to resolve)
+        - feishu.cn/docs/<token> (legacy)
+        - Raw token strings
+        """
+        if not url_or_token:
+            raise ValueError("URL or Token cannot be empty.")
+
+        # Check for Wiki URL
+        wiki_match = re.search(r'/wiki/([a-zA-Z0-9]+)', url_or_token)
+        if wiki_match:
+            wiki_token = wiki_match.group(1)
+            if client:
+                return client.resolve_wiki_token(wiki_token)
+            else:
+                # If no client provided, we can't resolve. Warn or fail?
+                # For basic extraction it's fine, but for operations we need resolved token.
+                # We'll assume the caller will resolve it if they passed a client.
+                # If they didn't pass a client, we just return the wiki token? 
+                # No, that will cause API errors later.
+                # Ideally, this method should always have a client if wiki is involved.
+                raise ValueError("Wiki URL detected but no client provided for resolution.")
+
+        # Check for Docx URL
+        docx_match = re.search(r'/docx/([a-zA-Z0-9]+)', url_or_token)
+        if docx_match:
+            return docx_match.group(1)
+
+        # Check for Legacy Docs URL
+        docs_match = re.search(r'/docs/([a-zA-Z0-9]+)', url_or_token)
+        if docs_match:
+            return docs_match.group(1)
+
+        # Assume raw token
+        # Basic validation: alphanumeric
+        if re.match(r'^[a-zA-Z0-9]+$', url_or_token):
+            # Smart Wiki Detection:
+            # If it doesn't look like a standard docx token (starting with 'dox'), 
+            # try to resolve it as a Wiki token first.
+            if client and not url_or_token.startswith("dox"):
+                try:
+                    # Silence stderr for this speculative check
+                    # Actually, we can't easily silence stderr from here, but it's fine.
+                    return client.resolve_wiki_token(url_or_token)
+                except Exception:
+                    # Not a wiki token, or resolution failed. Treat as raw doc token.
+                    pass
+            return url_or_token
+            
+        # If it looks like a URL but didn't match patterns
+        if "http" in url_or_token:
+            raise ValueError(f"Could not extract token from URL: {url_or_token}")
+
+        return url_or_token
+
+# -----------------------------------------------------------------------------
+# Markdown Parser
+# -----------------------------------------------------------------------------
+
+class MarkdownParser:
+    """Converts Markdown text into Feishu Block structures."""
+    
+    @staticmethod
+    def parse(markdown_text: str) -> List[Dict]:
+        lines = markdown_text.split('\n')
+        blocks = []
+        
+        code_block_mode = False
+        code_content = []
+        code_language = ""
+        
+        for line in lines:
+            # Code Blocks
+            if line.strip().startswith('```'):
+                if code_block_mode:
+                    # End code block
+                    blocks.append(MarkdownParser._create_code_block('\n'.join(code_content), code_language))
+                    code_block_mode = False
+                    code_content = []
+                    code_language = ""
+                else:
+                    # Start code block
+                    code_block_mode = True
+                    code_language = line.strip().replace('```', '').strip()
+                continue
+            
+            if code_block_mode:
+                code_content.append(line)
+                continue
+            
+            # Headings
+            if line.startswith('#'):
+                level = 0
+                for char in line:
+                    if char == '#': level += 1
+                    else: break
+                if 0 < level <= 9 and len(line) > level and line[level] == ' ':
+                    content = line[level+1:]
+                    blocks.append(MarkdownParser._create_heading_block(content, level))
+                    continue
+            
+            # Lists
+            if line.strip().startswith('- ') or line.strip().startswith('* '):
+                content = line.strip()[2:]
+                blocks.append(MarkdownParser._create_text_block(content, BlockType.BULLET))
+                continue
+            
+            if re.match(r'^\d+\.\s', line.strip()):
+                content = re.sub(r'^\d+\.\s', '', line.strip())
+                blocks.append(MarkdownParser._create_text_block(content, BlockType.ORDERED))
+                continue
+            
+            # Blockquotes
+            if line.strip().startswith('> '):
+                content = line.strip()[2:]
+                blocks.append(MarkdownParser._create_text_block(content, BlockType.QUOTE))
+                continue
+
+            # Standard Text
+            if line.strip():
+                blocks.append(MarkdownParser._create_text_block(line, BlockType.TEXT))
+        
+        return blocks
+
+    @staticmethod
+    def _create_text_element(content: str) -> List[Dict]:
+        """Parses inline styles (bold, links) within text."""
+        elements = []
+        
+        # Regex for [link](url) and **bold**
+        link_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
+        bold_pattern = r'\*\*([^*]+)\*\*'
+        
+        matches = []
+        for m in re.finditer(link_pattern, content):
+            matches.append((m.start(), m.end(), 'link', m))
+        for m in re.finditer(bold_pattern, content):
+            matches.append((m.start(), m.end(), 'bold', m))
+            
+        matches.sort(key=lambda x: x[0])
+        
+        last_idx = 0
+        for start, end, m_type, match in matches:
+            if start < last_idx: continue # Skip overlapping
+                
+            if start > last_idx:
+                elements.append({"text_run": {"content": content[last_idx:start]}})
+                
+            if m_type == 'link':
+                link_text, link_url = match.group(1), match.group(2)
+                elements.append({
+                    "text_run": {
+                        "content": link_text,
+                        "text_element_style": {"link": {"url": urllib.parse.quote(link_url, safe=':/?=&')}}
+                    }
+                })
+            elif m_type == 'bold':
+                bold_text = match.group(1)
+                elements.append({
+                    "text_run": {
+                        "content": bold_text,
+                        "text_element_style": {"bold": True}
+                    }
+                })
+                
+            last_idx = end
+            
+        if last_idx < len(content):
+            elements.append({"text_run": {"content": content[last_idx:]}})
+            
+        if not elements:
+            elements.append({"text_run": {"content": ""}})
+            
+        return elements
+
+    @staticmethod
+    def _create_text_block(content: str, block_type: BlockType) -> Dict:
+        type_key_map = {
+            BlockType.TEXT: "text",
+            BlockType.BULLET: "bullet",
+            BlockType.ORDERED: "ordered",
+            BlockType.QUOTE: "quote",
+            BlockType.TODO: "todo"
+        }
+        key = type_key_map.get(block_type, "text")
+        return {
+            "block_type": block_type.value,
+            key: {"elements": MarkdownParser._create_text_element(content)}
+        }
+
+    @staticmethod
+    def _create_heading_block(content: str, level: int) -> Dict:
+        # Heading 1 is type 3, Heading 9 is type 11
+        block_type_val = 2 + level
+        key = f"heading{level}"
+        return {
+            "block_type": block_type_val,
+            key: {"elements": MarkdownParser._create_text_element(content)}
+        }
+
+    @staticmethod
+    def _create_code_block(content: str, language: str) -> Dict:
+        lang_map = {
+            "python": 49, "py": 49, "bash": 7, "sh": 7, "javascript": 30, "js": 30,
+            "json": 28, "go": 22, "java": 29, "cpp": 9, "c": 10, "html": 24, 
+            "css": 12, "sql": 56, "markdown": 39, "md": 39, "text": 1
+        }
+        lang_id = lang_map.get(language.lower(), 1)
+        return {
+            "block_type": 14,
+            "code": {
+                "elements": [{"text_run": {"content": content}}],
+                "style": {"language": lang_id}
+            }
+        }
+
+# -----------------------------------------------------------------------------
+# Document Service
+# -----------------------------------------------------------------------------
+
+class DocService:
+    """High-level document operations."""
+
+    def __init__(self, client: FeishuClient):
+        self.client = client
+
+    def create(self, title: str, folder_token: Optional[str] = None) -> DocInfo:
+        path = "/docx/v1/documents"
+        payload = {"title": title, "folder_token": folder_token} if folder_token else {"title": title}
+        data = self.client.request("POST", path, json_data=payload)
+        doc = data.get("data", {}).get("document", {})
+        return DocInfo(
+            doc_token=doc.get("document_id"),
+            title=doc.get("title"),
+            owner_id=doc.get("owner_id"),
+            url=f"https://feishu.cn/docx/{doc.get('document_id')}"
+        )
+
+    def get_raw_content(self, doc_token: str) -> str:
+        path = f"/docx/v1/documents/{doc_token}/raw_content"
+        data = self.client.request("GET", path)
+        return data.get("data", {}).get("content", "")
+
+    def list_blocks(self, doc_token: str) -> List[Block]:
+        """Fetch all blocks in the document."""
+        path = f"/docx/v1/documents/{doc_token}/blocks"
+        blocks = []
+        page_token = None
+        
+        while True:
+            params = {"page_size": 500}
+            if page_token: params["page_token"] = page_token
+            
+            data = self.client.request("GET", path, params=params)
+            items = data.get("data", {}).get("items", [])
+            
+            for item in items:
+                blocks.append(Block(
+                    block_id=item.get("block_id"),
+                    parent_id=item.get("parent_id"),
+                    block_type=item.get("block_type"),
+                    children=item.get("children", []),
+                    content=item
+                ))
+            
+            if not data.get("data", {}).get("has_more"): break
+            page_token = data.get("data", {}).get("page_token")
+            
+        return blocks
+
+    def create_blocks(self, doc_token: str, parent_id: str, blocks_data: List[Dict], index: int = -1):
+        """Batch create blocks under a parent."""
+        if not blocks_data: return
+        
+        path = f"/docx/v1/documents/{doc_token}/blocks/{parent_id}/children"
+        
+        # Chunking to respect API guidelines (though strict limit is not documented, 50 is safe)
+        chunk_size = 50
+        for i in range(0, len(blocks_data), chunk_size):
+            chunk = blocks_data[i:i+chunk_size]
+            payload = {"children": chunk}
+            if index != -1:
+                payload["index"] = index
+                # If we are inserting at a specific index, subsequent chunks need updated index
+                # But typically 'index' is for the start. 
+                # API behavior: if we insert chunk1 at index 0, they take 0..49.
+                # If we insert chunk2 at index 50?
+                # Actually, simpler to just insert. But if index is specified, we must be careful.
+                # If index is -1 (append), subsequent chunks also append.
+                # If index is specific, we should probably increment it or let API handle?
+                # For safety in this tool, if index != -1, we might just do one big batch 
+                # or we assume the user only inserts small content at specific index.
+                # Let's keep it simple: just pass index for the first chunk? 
+                # No, that puts chunk1 at index, and chunk2 appends?
+                # Correct logic for split chunks at specific index:
+                # Chunk 1 at Index. Chunk 2 at Index + len(Chunk 1).
+                index += len(chunk)
+            
+            self.client.request("POST", path, json_data=payload)
+
+    def delete_block(self, doc_token: str, block_id: str):
+        path = f"/docx/v1/documents/{doc_token}/blocks/{block_id}"
+        try:
+            self.client.request("DELETE", path)
+        except Exception as e:
+            # Fallback for root block or specific permission issues
+            print(f"Direct delete failed: {e}. Trying to delete as child of root...", file=sys.stderr)
+            self.delete_children(doc_token, doc_token, [block_id])
+
+    def delete_children(self, doc_token: str, parent_id: str, children_ids: List[str]):
+        if not children_ids: return
+        path = f"/docx/v1/documents/{doc_token}/blocks/{parent_id}/children/batch_delete"
+        
+        chunk_size = 50
+        for i in range(0, len(children_ids), chunk_size):
+            chunk = children_ids[i:i+chunk_size]
+            payload = {"children": chunk}
+            self.client.request("POST", path, json_data=payload)
+
+    def batch_delete_blocks(self, doc_token: str, block_ids: List[str], parent_id: Optional[str] = None):
+        """
+        Smart batch delete. 
+        If parent_id provided, uses `batch_delete` (faster).
+        If fails or no parent_id, falls back to individual `delete_block`.
+        """
+        if not block_ids: return
+        
+        if parent_id:
+            try:
+                self.delete_children(doc_token, parent_id, block_ids)
+                return
+            except Exception as e:
+                print(f"Batch delete failed: {e}. Falling back to individual delete.", file=sys.stderr)
+        
+        for bid in block_ids:
+            self.delete_block(doc_token, bid)
+
+    def clear_doc(self, doc_token: str):
+        """Clears all content from the document."""
+        # Get all children of the root block (doc_token is the root block ID for docx)
+        path = f"/docx/v1/documents/{doc_token}/blocks/{doc_token}/children"
+        data = self.client.request("GET", path)
+        children = data.get("data", {}).get("items", [])
+        child_ids = [c.get("block_id") for c in children]
+        
+        self.delete_children(doc_token, doc_token, child_ids)
+
+# -----------------------------------------------------------------------------
+# Permission Service
+# -----------------------------------------------------------------------------
+
+class PermissionService:
+    def __init__(self, client: FeishuClient):
+        self.client = client
+
+    def transfer_owner(self, token: str, member_id: str, member_type: str, remove_old: bool):
+        path = f"/drive/v1/permissions/{token}/members/transfer_owner"
+        params = {
+            "type": "docx", 
+            "need_notification": "true", 
+            "remove_old_owner": str(remove_old).lower()
+        }
+        payload = {"member_type": member_type, "member_id": member_id}
+        self.client.request("POST", path, params=params, json_data=payload)
+
+    def add_member(self, token: str, member_id: str, member_type: str, perm: str):
+        path = f"/drive/v1/permissions/{token}/members"
+        params = {"type": "docx"}
+        payload = {"member_type": member_type, "member_id": member_id, "perm": perm}
+        self.client.request("POST", path, params=params, json_data=payload)
+
+# -----------------------------------------------------------------------------
+# CLI Helpers
+# -----------------------------------------------------------------------------
+
+def get_markdown_input(arg_markdown: Optional[str]) -> str:
+    """Reads Markdown from argument or stdin."""
+    if arg_markdown and arg_markdown != "-":
+        return arg_markdown
+    
+    # Check if stdin has data
+    if not sys.stdin.isatty():
+        content = sys.stdin.read()
+        if content: return content
+        
+    if arg_markdown == "-":
+        print("Error: '-' specified but no input from stdin.", file=sys.stderr)
+        sys.exit(1)
+        
+    return "" # Return empty if optional
+
+def detect_member_type(member_id: str) -> str:
+    if member_id.startswith("ou_"): return "openid"
+    if member_id.startswith("on_"): return "unionid"
+    if member_id.startswith("oc_"): return "chat"
+    if "@" in member_id: return "email"
+    return "userid"
+
+def print_structure(blocks: List[Block]):
+    has_structure = False
+    for block in blocks:
+        if 3 <= block.block_type <= 11: # Headings
+            has_structure = True
+            level = block.block_type - 2
+            heading_key = f"heading{level}"
+            elements = block.content.get(heading_key, {}).get("elements", [])
+            text = "".join([e.get("text_run", {}).get("content", "") for e in elements])
+            print(f"{'  ' * (level-1)}# {text} [ID: {block.block_id}]")
+            
+    if not has_structure:
+        print("(No headings found)", file=sys.stderr)
+
+def find_block_by_text(blocks: List[Block], text: str) -> Optional[Tuple[Block, int]]:
+    for i, block in enumerate(blocks):
+        if 3 <= block.block_type <= 11:
+            level = block.block_type - 2
+            heading_key = f"heading{level}"
+            elements = block.content.get(heading_key, {}).get("elements", [])
+            content = "".join([e.get("text_run", {}).get("content", "") for e in elements])
+            if content.strip() == text.strip():
+                return block, i
+    return None
+
+def get_section_range(blocks: List[Block], start_index: int) -> List[str]:
+    if start_index >= len(blocks): return []
+    
+    start_block = blocks[start_index]
+    start_level = start_block.block_type - 2 if 3 <= start_block.block_type <= 11 else 0
+    
+    ids = [start_block.block_id]
+    
+    for i in range(start_index + 1, len(blocks)):
+        block = blocks[i]
+        if 3 <= block.block_type <= 11:
+            level = block.block_type - 2
+            if level <= start_level:
+                break
+        ids.append(block.block_id)
+        
+    return ids
+
+# -----------------------------------------------------------------------------
+# Main CLI
+# -----------------------------------------------------------------------------
+
+def main():
+    # Parent parser for global args
+    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument("--app-id", help="Feishu App ID")
+    parent_parser.add_argument("--app-secret", help="Feishu App Secret")
+
+    parser = argparse.ArgumentParser(description="Feishu Docs CLI", parents=[parent_parser])
+    subparsers = parser.add_subparsers(dest="command", help="Command")
+
+    # Define subcommands
+    # 1. create-doc
+    p_create = subparsers.add_parser("create-doc", parents=[parent_parser])
+    p_create.add_argument("title")
+    p_create.add_argument("--folder")
+
+    # 2. get-content
+    p_get = subparsers.add_parser("get-content", parents=[parent_parser])
+    p_get.add_argument("url")
+
+    # 3. list-blocks
+    p_list = subparsers.add_parser("list-blocks", parents=[parent_parser])
+    p_list.add_argument("url")
+
+    # 4. structure
+    p_struct = subparsers.add_parser("structure", parents=[parent_parser])
+    p_struct.add_argument("url")
+
+    # 5. append
+    p_append = subparsers.add_parser("append", parents=[parent_parser])
+    p_append.add_argument("url")
+    p_append.add_argument("markdown", nargs="?")
+
+    # 6. overwrite
+    p_overwrite = subparsers.add_parser("overwrite", parents=[parent_parser])
+    p_overwrite.add_argument("url")
+    p_overwrite.add_argument("markdown", nargs="?")
+
+    # 7. insert
+    p_insert = subparsers.add_parser("insert", parents=[parent_parser])
+    p_insert.add_argument("url")
+    p_insert.add_argument("markdown", nargs="?")
+    g_insert = p_insert.add_mutually_exclusive_group(required=True)
+    g_insert.add_argument("--parent-id")
+    g_insert.add_argument("--after")
+    g_insert.add_argument("--before")
+    p_insert.add_argument("--index", type=int, default=0)
+
+    # 8. delete
+    p_delete = subparsers.add_parser("delete", parents=[parent_parser])
+    p_delete.add_argument("url")
+    g_delete = p_delete.add_mutually_exclusive_group(required=True)
+    g_delete.add_argument("--block-id")
+    g_delete.add_argument("--section")
+
+    # 9. replace
+    p_replace = subparsers.add_parser("replace", parents=[parent_parser])
+    p_replace.add_argument("url")
+    p_replace.add_argument("markdown", nargs="?")
+    g_replace = p_replace.add_mutually_exclusive_group(required=True)
+    g_replace.add_argument("--block-id")
+    g_replace.add_argument("--section")
+    
+    # 10. transfer-owner
+    p_transfer = subparsers.add_parser("transfer-owner", parents=[parent_parser])
+    p_transfer.add_argument("url")
+    p_transfer.add_argument("member_id")
+    p_transfer.add_argument("member_type", nargs="?")
+    p_transfer.add_argument("--remove-old", action="store_true")
+
+    # 11. add-member
+    p_add_member = subparsers.add_parser("add-member", parents=[parent_parser])
+    p_add_member.add_argument("url")
+    p_add_member.add_argument("member_id")
+    p_add_member.add_argument("perm", choices=["view", "edit", "full_access"])
+    p_add_member.add_argument("member_type", nargs="?")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return
+
+    # Execution
+    try:
+        client = FeishuClient(args.app_id, args.app_secret)
+        docs = DocService(client)
+        perms = PermissionService(client)
+        
+        # Resolve Token
+        if hasattr(args, 'url'):
+            token = FeishuClient.extract_token(args.url, client)
+
+        if args.command == "create-doc":
+            info = docs.create(args.title, args.folder)
+            print(json.dumps(asdict(info), indent=2))
+
+        elif args.command == "get-content":
+            print(docs.get_raw_content(token))
+
+        elif args.command == "list-blocks":
+            blocks = docs.list_blocks(token)
+            print(json.dumps([b.to_dict() for b in blocks], default=str, indent=2))
+
+        elif args.command == "structure":
+            blocks = docs.list_blocks(token)
+            print_structure(blocks)
+
+        elif args.command in ["append", "overwrite"]:
+            content = get_markdown_input(args.markdown)
+            if not content:
+                print("Error: No content provided.", file=sys.stderr)
+                sys.exit(1)
+                
+            if args.command == "overwrite":
+                docs.clear_doc(token)
+                
+            blocks_data = MarkdownParser.parse(content)
+            docs.create_blocks(token, token, blocks_data) # token is root block
+            print(f"Success: {args.command} completed.")
+
+        elif args.command == "insert":
+            content = get_markdown_input(args.markdown)
+            blocks_data = MarkdownParser.parse(content)
+            
+            if args.parent_id:
+                docs.create_blocks(token, args.parent_id, blocks_data, args.index)
+            elif args.after or args.before:
+                target_text = args.after or args.before
+                blocks = docs.list_blocks(token)
+                found = find_block_by_text(blocks, target_text)
+                if not found:
+                    raise RuntimeError(f"Heading '{target_text}' not found.")
+                
+                target_block, idx = found
+                parent_id = target_block.parent_id or token
+                
+                # Calculate sibling index
+                siblings = [b for b in blocks if (b.parent_id or token) == parent_id]
+                try:
+                    sibling_idx = next(i for i, b in enumerate(siblings) if b.block_id == target_block.block_id)
+                except StopIteration:
+                    sibling_idx = 0
+                
+                insert_idx = sibling_idx + 1 if args.after else sibling_idx
+                docs.create_blocks(token, parent_id, blocks_data, insert_idx)
+            
+            print("Success: Content inserted.")
+
+        elif args.command == "delete":
+            if args.block_id:
+                docs.delete_block(token, args.block_id)
+            elif args.section:
+                blocks = docs.list_blocks(token)
+                found = find_block_by_text(blocks, args.section)
+                if not found:
+                    raise RuntimeError(f"Heading '{args.section}' not found.")
+                _, idx = found
+                ids = get_section_range(blocks, idx)
+                # Parent of the heading is the parent for all (assuming flat-ish structure or top level)
+                # Ideally we check parent of each, but batch delete requires same parent.
+                # Usually sections are flat under root or under another heading?
+                # Actually in Feishu docx, headings are just blocks. They don't strictly contain children in tree.
+                # So they share the same parent (e.g. root).
+                parent_id = blocks[idx].parent_id or token
+                docs.batch_delete_blocks(token, ids, parent_id)
+            print("Success: Deleted.")
+
+        elif args.command == "replace":
+            content = get_markdown_input(args.markdown)
+            blocks_data = MarkdownParser.parse(content)
+            
+            if args.block_id:
+                # Naive replace: delete then insert (at same parent, same index?)
+                # To do it right we need index.
+                # Simple approach: Delete, then Append? No, order matters.
+                # We need to list blocks to find index.
+                blocks = docs.list_blocks(token)
+                target = next((b for b in blocks if b.block_id == args.block_id), None)
+                if not target: raise RuntimeError("Block not found")
+                
+                parent_id = target.parent_id or token
+                siblings = [b for b in blocks if (b.parent_id or token) == parent_id]
+                idx = next(i for i, b in enumerate(siblings) if b.block_id == args.block_id)
+                
+                docs.delete_block(token, args.block_id)
+                if blocks_data:
+                    docs.create_blocks(token, parent_id, blocks_data, idx)
+                    
+            elif args.section:
+                blocks = docs.list_blocks(token)
+                found = find_block_by_text(blocks, args.section)
+                if not found: raise RuntimeError(f"Heading '{args.section}' not found.")
+                
+                target_block, idx = found
+                ids = get_section_range(blocks, idx)
+                parent_id = target_block.parent_id or token
+                
+                siblings = [b for b in blocks if (b.parent_id or token) == parent_id]
+                sibling_idx = next(i for i, b in enumerate(siblings) if b.block_id == target_block.block_id)
+                
+                docs.batch_delete_blocks(token, ids, parent_id)
+                if blocks_data:
+                    docs.create_blocks(token, parent_id, blocks_data, sibling_idx)
+            
+            print("Success: Replaced.")
+
+        elif args.command == "transfer-owner":
+            m_type = args.member_type or detect_member_type(args.member_id)
+            perms.transfer_owner(token, args.member_id, m_type, args.remove_old)
+            print("Success: Ownership transferred.")
+
+        elif args.command == "add-member":
+            m_type = args.member_type or detect_member_type(args.member_id)
+            perms.add_member(token, args.member_id, m_type, args.perm)
+            print("Success: Member added.")
+
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
