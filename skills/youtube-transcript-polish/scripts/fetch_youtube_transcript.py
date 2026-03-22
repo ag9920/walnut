@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""YouTube Transcript Skill Script
+"""YouTube Transcript Skill Script (Supadata 版本)
 
 职责：
-- 使用 `youtube-transcript-api` 从指定的 YouTube 视频链接中获取完整字幕；
+- 使用 Supadata API 从指定的 YouTube 视频链接中获取完整字幕；
 - 以纯文本形式输出字幕，供上层 Skill / Agent 进行轻度润色和 Markdown 整理；
 - 如传入 `--print-prompt`，则额外输出一段可直接给大模型使用的润色提示词。
+
+环境变量：
+- SUPADATA_API_KEY: Supadata API Key (必需，默认从环境变量读取)
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from typing import Iterable, List, Optional
 
-from youtube_transcript_api import (
-    NoTranscriptFound,
-    TranscriptsDisabled,
-    YouTubeTranscriptApi,
-)
+import requests
 
 
 class TranscriptError(Exception):
@@ -31,6 +31,8 @@ _YOUTUBE_VIDEO_ID_PATTERN = re.compile(
     """,
     re.VERBOSE,
 )
+
+SUPADATA_BASE_URL = "https://api.supadata.ai/v1"
 
 
 def extract_video_id(url_or_id: str) -> str:
@@ -47,39 +49,89 @@ def extract_video_id(url_or_id: str) -> str:
 
 def get_youtube_transcript(
     url_or_id: str,
+    api_key: Optional[str] = None,
     languages: Optional[Iterable[str]] = None,
 ) -> str:
-    """获取指定 YouTube 视频的完整字幕文本。"""
+    """使用 Supadata API 获取指定 YouTube 视频的完整字幕文本。
 
+    Args:
+        url_or_id: YouTube 视频链接或 11 位视频 ID
+        api_key: Supadata API Key，如未提供则从环境变量 SUPADATA_API_KEY 读取
+        languages: 字幕语言代码列表，如未提供则使用 API 默认行为
+
+    Returns:
+        完整的字幕文本
+
+    Raises:
+        TranscriptError: 当无法获取字幕时抛出
+    """
     video_id = extract_video_id(url_or_id)
 
-    # 默认按常见的中英文顺序尝试
-    lang_list: List[str]
-    if languages is None:
-        lang_list = ["zh-Hans", "zh-Hant", "zh", "en"]
-    else:
+    # 获取 API Key：优先使用传入的参数，否则从环境变量读取
+    key = api_key or os.environ.get("SUPADATA_API_KEY")
+    if not key:
+        raise TranscriptError(
+            "未找到 Supadata API Key。请通过以下方式之一提供：\n"
+            "1. 设置环境变量 SUPADATA_API_KEY\n"
+            "2. 调用函数时传入 api_key 参数\n"
+            "获取 API Key: https://dash.supadata.ai"
+        )
+
+    # 构建请求
+    headers = {
+        "x-api-key": key,
+        "Accept": "application/json",
+    }
+
+    params: dict = {"videoId": video_id}
+    if languages:
+        # Supadata 支持 lang 参数指定语言
         lang_list = list(languages)
+        if lang_list:
+            params["lang"] = lang_list[0]  # 优先使用第一个语言
 
     try:
-        segments = YouTubeTranscriptApi().fetch(video_id, languages=lang_list)
-    except (NoTranscriptFound, TranscriptsDisabled) as exc:
-        raise TranscriptError(f"该视频没有可用字幕或字幕被关闭: {exc}") from exc
-    except Exception as exc:  # noqa: BLE001
+        response = requests.get(
+            f"{SUPADATA_BASE_URL}/youtube/transcript",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.HTTPError as exc:
+        if exc.response.status_code == 401:
+            raise TranscriptError("API Key 无效或已过期，请检查 SUPADATA_API_KEY") from exc
+        elif exc.response.status_code == 404:
+            raise TranscriptError("该视频没有可用字幕或视频不存在") from exc
+        elif exc.response.status_code == 429:
+            raise TranscriptError("API 请求频率超限，请稍后再试") from exc
+        else:
+            raise TranscriptError(f"API 请求失败: {exc}") from exc
+    except requests.exceptions.RequestException as exc:
+        raise TranscriptError(f"网络请求失败: {exc}") from exc
+    except Exception as exc:
         raise TranscriptError(f"获取字幕失败: {exc}") from exc
 
-    # 兼容不同版本的返回结构：
+    # 解析响应数据
+    # Supadata 返回格式: {"content": [{"text": "...", "start": 0.0, "duration": 1.0}, ...]}
+    content = data.get("content", [])
+    if not content:
+        raise TranscriptError("API 返回的字幕内容为空")
+
     texts: List[str] = []
-    for seg in segments:
-        if hasattr(seg, "text"):
-            text = str(seg.text)
-        elif isinstance(seg, dict):  # type: ignore[deprecated-type]
-            text = str(seg.get("text", ""))
+    for segment in content:
+        if isinstance(segment, dict):
+            text = str(segment.get("text", ""))
         else:
-            text = str(seg)
+            text = str(segment)
 
         text = text.replace("\n", " ").strip()
         if text:
             texts.append(text)
+
+    if not texts:
+        raise TranscriptError("未能从响应中提取到有效字幕文本")
 
     return " ".join(texts)
 
@@ -104,15 +156,20 @@ def _cli(argv: Optional[Iterable[str]] = None) -> int:
     """简单的命令行入口，便于本地调试 skill。"""
 
     parser = argparse.ArgumentParser(
-        description="Fetch YouTube transcript via youtube-transcript-api",
+        description="Fetch YouTube transcript via Supadata API",
     )
     parser.add_argument("url", help="YouTube 视频链接或 11 位视频 ID")
     parser.add_argument(
+        "-k",
+        "--api-key",
+        dest="api_key",
+        help="Supadata API Key，也可通过环境变量 SUPADATA_API_KEY 设置",
+    )
+    parser.add_argument(
         "-l",
         "--lang",
-        dest="languages",
-        action="append",
-        help="字幕语言代码，可多次指定，例如: -l zh-Hans -l en",
+        dest="language",
+        help="字幕语言代码，例如: zh-Hans, en",
     )
     parser.add_argument(
         "--print-prompt",
@@ -122,9 +179,18 @@ def _cli(argv: Optional[Iterable[str]] = None) -> int:
 
     args = parser.parse_args(list(argv) if argv is not None else None)
 
+    # 优先使用命令行传入的 api_key，否则使用环境变量
+    api_key = args.api_key or os.environ.get("SUPADATA_API_KEY")
+
+    languages = [args.language] if args.language else None
+
     try:
-        transcript = get_youtube_transcript(args.url, languages=args.languages)
-    except TranscriptError as exc:  # noqa: BLE001
+        transcript = get_youtube_transcript(
+            args.url,
+            api_key=api_key,
+            languages=languages,
+        )
+    except TranscriptError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
 
@@ -144,4 +210,3 @@ def main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover - 手动执行入口
     main()
-
